@@ -82,4 +82,79 @@ make run
 
 ---
 
-<!-- Add Day 2 entry below -->
+### Day 2 — 2026-07-09
+
+**Goal:** Prove the ingestion architecture shape — config → service → Redis list — without HTTP or production hardening yet.
+
+#### Config (`internal/config/config.go`)
+
+Replaced the stub with a `Config` struct and `Load()` returning hardcoded local defaults:
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `HTTPAddr` | `:8080` | Future HTTP listen address |
+| `RedisAddr` | `localhost:6379` | Redis from `docker-compose` |
+| `RedisListKey` | `vanguard:events:ingest` | List name for queued events |
+
+#### Redis queue (`internal/queue/redis.go`)
+
+New package for enqueueing events onto a Redis list:
+
+- `Enqueuer` interface — `Enqueue(ctx, []byte) error` (enables fakes in tests later)
+- `RedisEnqueuer` — wraps `github.com/redis/go-redis/v9`
+- `LPUSH` onto `REDIS_LIST_KEY` (future worker will `BRPOP` for FIFO)
+
+Added `go-redis/v9` to `go.mod`.
+
+#### Ingest service (`internal/service/ingest.go`)
+
+Started the service layer for event ingestion:
+
+- `IngestRequest` — `client_id`, `event_type`, `payload` (`json.RawMessage`)
+- `Validate()` — requires non-empty `client_id` and `event_type`
+- `BuildEnvelope()` — adds server-side `received_at` (RFC3339) before enqueue
+- `Enqueue()` — marshals envelope JSON and calls `queue.Enqueuer`
+
+Envelope shape written to Redis (matches the `events` table intent):
+
+```json
+{
+  "client_id": "acme",
+  "event_type": "page_view",
+  "payload": { "url": "/home" },
+  "received_at": "2026-07-09T11:00:00Z"
+}
+```
+
+#### Queue demo (`cmd/queue_demo/main.go`)
+
+Scratch binary to prove Go → Redis without HTTP:
+
+```bash
+make up
+go run ./cmd/queue_demo
+docker compose exec redis redis-cli LRANGE vanguard:events:ingest 0 -1
+```
+
+#### Still stubs / not wired yet
+
+- `internal/handler/` — no `POST /v1/events` handler
+- `internal/server/` — no mux or `http.Server`
+- `cmd/vanguard/main.go` — empty entrypoint (no `func main` yet)
+
+#### Gotchas learned
+
+- **Package-level `:=` is invalid** — short assignment only works inside functions; use `var`, `const`, or a `Load()` that returns a struct.
+- **`main` belongs in `cmd/`** — `func main()` inside `internal/queue` does not produce a runnable binary; use `cmd/queue_demo` for scratch programs.
+- **Listen address needs a colon** — `":8080"` for `http.ListenAndServe`, not `"8080"`.
+- **`LPUSH` returns a status, not an error** — call `.Err()` on the Redis result to surface failures.
+
+#### Day 2 commands (typical flow)
+
+```bash
+make up
+go run ./cmd/queue_demo
+docker compose exec redis redis-cli LRANGE vanguard:events:ingest 0 -1
+```
+
+---
