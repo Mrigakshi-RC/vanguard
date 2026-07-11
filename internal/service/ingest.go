@@ -45,3 +45,25 @@ func (r *IngestRequest) Enqueue(ctx context.Context, q queue.Enqueuer) error {
 	}
 	return q.Enqueue(ctx, envelope)
 }
+
+// The structural worker that connects handler to queue
+type IngestService struct {
+	q queue.Enqueuer
+}
+
+func NewIngestService(q queue.Enqueuer) *IngestService {
+	return &IngestService{q: q}
+}
+
+func (s *IngestService) Ingest(ctx context.Context, req IngestRequest) error {
+	if err := req.Validate(); err != nil {
+		return err
+	}
+
+	envelope, err := req.BuildEnvelope()
+	if err != nil {
+		return err
+	}
+
+	return s.q.Enqueue(ctx, envelope)
+}

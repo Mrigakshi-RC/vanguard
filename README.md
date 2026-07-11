@@ -158,3 +158,70 @@ docker compose exec redis redis-cli LRANGE vanguard:events:ingest 0 -1
 ```
 
 ---
+
+### Day 3 — 2026-07-11
+
+**Goal:** Wire the full HTTP ingestion path — `POST /v1/events` → handler → service → Redis list.
+
+#### HTTP handler (`internal/handler/ingest.go`)
+
+New `IngestHandler` implementing `http.Handler`:
+
+- Decodes JSON body into `service.IngestRequest`
+- Calls `IngestService.Ingest`
+- Returns `202 Accepted` + `{"status":"queued"}` on success
+- Returns `400 Bad Request` for invalid JSON or validation errors
+- Returns `405 Method Not Allowed` for non-POST requests
+
+#### Ingest service (`internal/service/ingest.go`)
+
+Refactored Day 2 request helpers into a proper service struct:
+
+- `IngestService` — holds `queue.Enqueuer`, connects handler to Redis
+- `NewIngestService(q)` — constructor injection of the queue
+- `Ingest(ctx, req)` — `Validate()` → `BuildEnvelope()` → `Enqueue()`
+
+#### App entrypoint (`cmd/vanguard/main.go`)
+
+Wired the full dependency chain and started the server:
+
+```
+config.Load()
+  → queue.NewRedisEnqueuer
+  → service.NewIngestService
+  → handler.NewIngestHandler
+  → http.ServeMux ("POST /v1/events")
+  → http.ListenAndServe
+```
+
+The ingestion architecture proof is now end-to-end over HTTP.
+
+#### Still deferred
+
+- `internal/server/` — routes live in `main` for now (no separate server package)
+- No Redis `Ping` at startup — server starts even if Redis is down
+- All service errors map to `400` (Redis failures should be `503` later)
+- No handler/service tests for ingest yet
+- No graceful shutdown, auth, or rate limiting
+
+#### Gotchas learned
+
+- **`http.Handler` vs handler func** — `IngestHandler` is a struct with `ServeHTTP`; register it directly on the mux with `mux.Handle("POST /v1/events", ingestHandler)`.
+- **Go 1.22+ route patterns** — `"POST /v1/events"` binds method and path in one string; no separate `HandleFunc` + manual method check needed (handler still guards non-POST as a fallback).
+- **Write headers before body** — call `w.WriteHeader` before `w.Write`; set `Content-Type` early.
+- **Transitive deps in `go.mod`** — `xxhash` and `atomic` are pulled in by `go-redis/v9`, not used directly.
+
+#### Day 3 commands (typical flow)
+
+```bash
+make up
+make run
+
+curl -s -X POST http://localhost:8080/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"client_id":"test","event_type":"ping","payload":{"n":1}}'
+
+docker compose exec redis redis-cli LRANGE vanguard:events:ingest 0 -1
+```
+
+---
