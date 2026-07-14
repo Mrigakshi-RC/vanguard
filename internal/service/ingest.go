@@ -1,10 +1,9 @@
 package service
 
+//service layer for POST /v1/events
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"time"
 
 	"github.com/Mrigakshi-RC/vanguard/internal/queue"
 )
@@ -17,36 +16,14 @@ type IngestRequest struct {
 
 func (r *IngestRequest) Validate() error {
 	if r.ClientID == "" {
-		return errors.New("client_id is required")
+		return ValidationError{Message: "client_id is required"}
 	}
 	if r.EventType == "" {
-		return errors.New("event_type is required")
+		return ValidationError{Message: "event_type is required"}
 	}
 	return nil
 }
 
-func (r *IngestRequest) BuildEnvelope() ([]byte, error) {
-	envelope, err := json.Marshal(map[string]any{
-		"client_id":   r.ClientID,
-		"event_type":  r.EventType,
-		"payload":     r.Payload,
-		"received_at": time.Now().Format(time.RFC3339),
-	})
-	if err != nil {
-		return nil, err
-	}
-	return envelope, nil
-}
-
-func (r *IngestRequest) Enqueue(ctx context.Context, q queue.Queue) error {
-	envelope, err := r.BuildEnvelope()
-	if err != nil {
-		return err
-	}
-	return q.Enqueue(ctx, envelope)
-}
-
-// The structural worker that connects handler to queue
 type IngestService struct {
 	q queue.Queue
 }
@@ -60,10 +37,13 @@ func (s *IngestService) Ingest(ctx context.Context, req IngestRequest) error {
 		return err
 	}
 
-	envelope, err := req.BuildEnvelope()
+	data, err := json.Marshal(req.ToEnvelope())
 	if err != nil {
 		return err
 	}
 
-	return s.q.Enqueue(ctx, envelope)
+	if err := s.q.Enqueue(ctx, data); err != nil {
+		return QueueError{Cause: err}
+	}
+	return nil
 }

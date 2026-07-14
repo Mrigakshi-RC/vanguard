@@ -2,22 +2,13 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"log"
-	"time"
 
 	"github.com/Mrigakshi-RC/vanguard/internal/db"
 	"github.com/Mrigakshi-RC/vanguard/internal/queue"
 	"github.com/Mrigakshi-RC/vanguard/internal/repository"
 	"github.com/jackc/pgx/v5/pgtype"
 )
-
-type EventEnvelope struct {
-	ClientID   string          `json:"client_id"`
-	EventType  string          `json:"event_type"`
-	Payload    json.RawMessage `json:"payload"`
-	ReceivedAt time.Time       `json:"received_at"`
-}
 
 type Worker struct {
 	q     queue.Queue
@@ -42,6 +33,9 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		data, err := w.q.Dequeue(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			continue
 		}
 
@@ -49,13 +43,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-func (w *Worker) processOne(ctx context.Context, data []byte) error {
-	var env EventEnvelope
-	if err := json.Unmarshal(data, &env); err != nil {
-		return nil
+func (w *Worker) processOne(ctx context.Context, data []byte) {
+	env, err := ParseEventEnvelope(data)
+	if err != nil {
+		log.Printf("Malformed event envelope: %v body=%s", err, truncateForLog(data, 256))
 	}
 
-	_, err := w.store.CreateEvent(ctx, db.CreateEventParams{
+	_, err = w.store.CreateEvent(ctx, db.CreateEventParams{
 		ClientID:  env.ClientID,
 		EventType: env.EventType,
 		Payload:   env.Payload,
@@ -67,6 +61,11 @@ func (w *Worker) processOne(ctx context.Context, data []byte) error {
 	if err != nil {
 		log.Printf("Database insertion failed: %v", err)
 	}
+}
 
-	return nil
+func truncateForLog(data []byte, max int) string {
+	if len(data) <= max {
+		return string(data)
+	}
+	return string(data[:max]) + "..."
 }

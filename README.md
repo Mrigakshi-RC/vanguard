@@ -40,7 +40,7 @@ Installed [goose](https://github.com/pressly/goose) and added the first migratio
 
 - `20260708062506_create_events_table.sql`
 - Enables `pgcrypto` for UUID generation
-- Creates `events` table: `id`, `client_id`, `event_type`, `payload` (JSONB), `status`, `received_at`, `processed_at`, `retry_count`, `last_error`
+- Creates `events` table: `id` (UUID), `client_id` (TEXT), `event_type` (TEXT), `payload` (JSONB), `status` (TEXT, default `pending`), `received_at` (TIMESTAMPTZ), `processed_at` (TIMESTAMPTZ, nullable)
 - Indexes on `status` and `client_id`
 
 #### Makefile targets
@@ -228,15 +228,20 @@ docker compose exec redis redis-cli LRANGE vanguard:events:ingest 0 -1
 
 ### Day 4 — 2026-07-14
 
-**Goal:** Add the worker path — Redis list → Postgres — using sqlc for typed SQL and a thin repository wrapper.
+**Goal:** Add the worker path (Redis → Postgres), the read API, and a cleanup/hardening pass on the codebase.
 
 #### Config (`internal/config/config.go`)
 
-Extended `Config` with Postgres connection settings:
+Extended `Config` with Postgres and env overrides (defaults unchanged for local dev):
 
-| Field | Default | Purpose |
+| Field | Env var | Default |
 |-------|---------|---------|
-| `PostgresDSN` | `postgres://vanguard:vanguard@localhost:5432/vanguard?sslmode=disable` | pgx pool connection string |
+| `HTTPAddr` | `VANGUARD_HTTP_ADDR` | `:8080` |
+| `RedisAddr` | `VANGUARD_REDIS_ADDR` | `localhost:6379` |
+| `RedisListKey` | `VANGUARD_REDIS_LIST_KEY` | `vanguard:events:ingest` |
+| `PostgresDSN` | `VANGUARD_POSTGRES_DSN` | `postgres://vanguard:vanguard@localhost:5432/vanguard?sslmode=disable` |
+
+`Load()` uses a small `envOr()` helper — unset vars fall back to defaults.
 
 #### Redis queue refactor (`internal/queue/redis.go`)
 
@@ -245,39 +250,79 @@ Merged enqueue/dequeue into a single abstraction:
 - `Queue` interface — `Enqueue(ctx, []byte) error` + `Dequeue(ctx) ([]byte, error)`
 - `RedisQueue` — one struct/client for both sides
 - `LPUSH` on enqueue, `BRPOP` (timeout `0`) on dequeue — FIFO with Day 2's push-left pattern
-- `cmd/vanguard/main.go` updated to `NewRedisQueue` (replacing separate enqueuer type)
+
+#### Shared envelope (`internal/service/envelope.go`)
+
+Single `EventEnvelope` type end-to-end (replaces Day 2's `map[string]any` + separate worker struct):
+
+- `IngestRequest.ToEnvelope()` — sets `received_at` as `time.Time`
+- `ParseEventEnvelope()` — used by the worker to unmarshal queue bytes
+- `IngestService.Ingest()` — `Validate()` → `json.Marshal(ToEnvelope())` → enqueue
 
 #### sqlc data layer
 
 Boot.dev-style sqlc setup for Postgres access:
 
 - `sqlc.yaml` — schema from `db/migrations/`, queries from `db/queries/`, generates into `internal/db/` with `pgx/v5`
-- `db/queries/events.sql` — `CreateEvent :one` INSERT with `status = 'pending'` and `RETURNING *`
+- `db/queries/events.sql` — `CreateEvent :one` (INSERT, `status = 'pending'`) and `GetEventByID :one`
 - Generated code: `internal/db/` (`Queries`, `Event`, `CreateEventParams`)
 
-Added `github.com/jackc/pgx/v5` (via sqlc + worker).
+Added `github.com/jackc/pgx/v5` (via sqlc + worker). Regenerate after query changes with `make sqlc`.
 
 #### Repository (`internal/repository/event.go`)
 
 Thin wrapper over sqlc-generated queries:
 
-- `EventStore` interface — `CreateEvent(ctx, db.CreateEventParams) (db.Event, error)`
-- `PostgresEventStore` — holds `*db.Queries`, delegates to `CreateEvent`
+- `EventStore` interface — `CreateEvent` + `GetEventByID`
+- `PostgresEventStore` — holds `*db.Queries`, delegates to sqlc
 
-Keeps the worker service testable without hand-writing SQL in Go.
+Interface exists so services can be tested with fakes without a real Postgres.
 
 #### Worker service (`internal/service/worker.go`)
 
-New background consumer:
+Background consumer:
 
-- `EventEnvelope` — mirrors the Redis JSON envelope (`client_id`, `event_type`, `payload`, `received_at`)
 - `Worker` — holds `queue.Queue` + `repository.EventStore`
-- `Run(ctx)` — infinite loop: `Dequeue` → `processOne`
-- `processOne` — unmarshal envelope → `store.CreateEvent` with `pgtype.Timestamptz`
+- `Run(ctx)` — loop: `Dequeue` → `processOne`; exits on `ctx.Done()` or when `Dequeue` fails on a canceled context
+- `processOne` — `ParseEventEnvelope` → `store.CreateEvent`
+- Malformed JSON is logged with a truncated body (`truncateForLog`, max 256 bytes) then dropped
+- DB insert failures are logged (no requeue yet)
 
-#### Worker entrypoint (`cmd/worker/main.go`)
+#### Read path — `GET /v1/events/{id}`
 
-Separate binary from the HTTP API:
+Added `GET /v1/events/{id}` to confirm events landed in Postgres:
+
+- `EventService` (`internal/service/event.go`) — validates UUID, fetches from store, maps `db.Event` → `EventResponse`
+- `GetEventHandler` (`internal/handler/get_event.go`) — 200 / 400 / 404 / 500
+- `cmd/vanguard/main.go` now opens a Postgres pool (same as worker) for reads
+
+#### HTTP routing (`internal/server/server.go`)
+
+Moved mux registration out of `main`:
+
+- `server.Routes` — `Ingest` + `GetEvent` handlers
+- `server.New(r Routes) http.Handler` — registers `POST /v1/events` and `GET /v1/events/{id}`
+
+#### Handler hardening (`internal/handler/`)
+
+- `response.go` — shared `writeJSON` / `writeJSONError` (safe JSON encoding, no string concatenation)
+- `ingest.go` — typed error mapping: `ValidationError` → 400, `QueueError` → 503; removed redundant POST method guard (mux handles it)
+- `errors.go` (service) — `ValidationError`, `QueueError`; ingest wraps Redis failures
+
+#### App entrypoints
+
+**API (`cmd/vanguard/main.go`):**
+
+```
+config.Load()
+  → pgxpool.New(PostgresDSN)
+  → queue.NewRedisQueue
+  → repository.NewPostgresEventStore
+  → IngestService + EventService
+  → handlers → server.New → ListenAndServe
+```
+
+**Worker (`cmd/worker/main.go`):**
 
 ```
 config.Load()
@@ -288,29 +333,50 @@ config.Load()
   → worker.Run
 ```
 
-Run API and worker as two processes for the full ingest → persist path.
+Run API and worker as two processes for the full ingest → persist → read path.
 
-#### End-to-end flow (Day 1–4)
+#### Makefile additions
+
+| Target | Purpose |
+|--------|---------|
+| `make worker` | Run the background consumer |
+| `make sqlc` | Regenerate `internal/db/` from SQL queries |
+
+#### Tests added
+
+| File | Covers |
+|------|--------|
+| `internal/service/service_test.go` | Envelope round-trip, `EventService.GetByID`, worker exits on cancel |
+| `internal/handler/ingest_test.go` | Ingest HTTP contract (400/503/202), safe JSON errors |
+| `internal/handler/get_event_test.go` | Get event HTTP contract |
+| `internal/config/config_test.go` | Defaults and env overrides |
+
+Removed unused `ValidateEventStatus` scaffolding (was never wired to production code).
+
+#### End-to-end flow
 
 ```
-POST /v1/events → Redis list (LPUSH) → worker (BRPOP) → sqlc CreateEvent → events table
+POST /v1/events → Redis (LPUSH) → worker (BRPOP) → CreateEvent → events table
+GET  /v1/events/{id} → EventService → GetEventByID → JSON response
 ```
 
 #### Still deferred
 
-- No `make sqlc` target — run `sqlc generate` manually after query/schema changes
-- Worker has no graceful shutdown (no signal handling / context cancel)
-- Bad JSON and DB failures are logged or dropped — no dead-letter queue or requeue
-- `Dequeue` errors are swallowed with `continue` (no ctx check on error path)
-- No worker or repository tests yet
-- `internal/server/` still unused
+- Graceful shutdown (SIGTERM, drain in-flight HTTP + worker)
+- Rate limiting
+- Retry + exponential backoff on DB writes
+- Dead-letter queue for permanently bad events
+- Requeue on transient DB failure (worker currently logs and drops)
+- `Failure Modes` doc
 
 #### Gotchas learned
 
 - **sqlc + goose** — point `schema` at migration files; sqlc reads the DDL, goose applies it at runtime
 - **`CreateEventParams.Payload` is `[]byte`** — pass `json.RawMessage` from the envelope directly; pgx maps it to JSONB
 - **`received_at` needs `pgtype.Timestamptz`** — sqlc generates pgx types, not plain `time.Time`, for nullable/timestamp columns
-- **`RETURNING *` vs explicit columns** — sqlc may emit a partial `Scan` if the table has columns not listed in RETURNING; keep query and migration in sync
+- **One envelope struct** — marshal/unmarshal with the same `EventEnvelope`; don't hand-build JSON maps on the producer side
+- **`EventStore` interface** — looks like a pass-through today, but enables fake stores in unit tests
+- **Worker cancel** — check `ctx.Err()` when `Dequeue` returns an error; otherwise the loop spins after context cancel
 - **Separate `cmd/worker`** — same pattern as `cmd/vanguard`; `internal/` packages are shared, binaries are not
 - **FIFO** — `LPUSH` + `BRPOP` is the correct pair; do not `BRPOP` from the same end you push
 
@@ -319,19 +385,21 @@ POST /v1/events → Redis list (LPUSH) → worker (BRPOP) → sqlc CreateEvent �
 ```bash
 make up
 make migrate-up
-sqlc generate
+make sqlc
 
 # terminal 1 — API
 make run
 
 # terminal 2 — worker
-go run ./cmd/worker
+make worker
 
+# ingest
 curl -s -X POST http://localhost:8080/v1/events \
   -H 'Content-Type: application/json' \
   -d '{"client_id":"test","event_type":"ping","payload":{"n":1}}'
 
-docker compose exec redis redis-cli LLEN vanguard:events:ingest
+# read back (use id from Postgres)
+curl -s http://localhost:8080/v1/events/<uuid>
 
 docker compose exec postgres psql -U vanguard -d vanguard \
   -c "SELECT id, client_id, event_type, status, received_at FROM events;"

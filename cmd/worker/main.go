@@ -9,7 +9,6 @@ import (
 	"github.com/Mrigakshi-RC/vanguard/internal/repository"
 	"github.com/Mrigakshi-RC/vanguard/internal/service"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func main() {

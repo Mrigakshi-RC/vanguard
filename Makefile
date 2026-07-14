@@ -29,3 +29,9 @@ migrate-down:
 	$(GOOSE) -dir db/migrations postgres "$(DB)" down
 migrate-status:
 	$(GOOSE) -dir db/migrations postgres "$(DB)" status
+
+worker:
+	go run ./cmd/worker
+
+sqlc:
+	sqlc generate
