@@ -13,7 +13,7 @@ import (
 func main() {
 	cfg := config.Load()
 
-	redisQueue := queue.NewRedisEnqueuer(cfg.RedisAddr, cfg.RedisListKey)
+	redisQueue := queue.NewRedisQueue(cfg.RedisAddr, cfg.RedisListKey)
 	ingestService := service.NewIngestService(redisQueue)
 	ingestHandler := handler.NewIngestHandler(ingestService)
 

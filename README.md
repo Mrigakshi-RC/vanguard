@@ -225,3 +225,116 @@ docker compose exec redis redis-cli LRANGE vanguard:events:ingest 0 -1
 ```
 
 ---
+
+### Day 4 — 2026-07-14
+
+**Goal:** Add the worker path — Redis list → Postgres — using sqlc for typed SQL and a thin repository wrapper.
+
+#### Config (`internal/config/config.go`)
+
+Extended `Config` with Postgres connection settings:
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `PostgresDSN` | `postgres://vanguard:vanguard@localhost:5432/vanguard?sslmode=disable` | pgx pool connection string |
+
+#### Redis queue refactor (`internal/queue/redis.go`)
+
+Merged enqueue/dequeue into a single abstraction:
+
+- `Queue` interface — `Enqueue(ctx, []byte) error` + `Dequeue(ctx) ([]byte, error)`
+- `RedisQueue` — one struct/client for both sides
+- `LPUSH` on enqueue, `BRPOP` (timeout `0`) on dequeue — FIFO with Day 2's push-left pattern
+- `cmd/vanguard/main.go` updated to `NewRedisQueue` (replacing separate enqueuer type)
+
+#### sqlc data layer
+
+Boot.dev-style sqlc setup for Postgres access:
+
+- `sqlc.yaml` — schema from `db/migrations/`, queries from `db/queries/`, generates into `internal/db/` with `pgx/v5`
+- `db/queries/events.sql` — `CreateEvent :one` INSERT with `status = 'pending'` and `RETURNING *`
+- Generated code: `internal/db/` (`Queries`, `Event`, `CreateEventParams`)
+
+Added `github.com/jackc/pgx/v5` (via sqlc + worker).
+
+#### Repository (`internal/repository/event.go`)
+
+Thin wrapper over sqlc-generated queries:
+
+- `EventStore` interface — `CreateEvent(ctx, db.CreateEventParams) (db.Event, error)`
+- `PostgresEventStore` — holds `*db.Queries`, delegates to `CreateEvent`
+
+Keeps the worker service testable without hand-writing SQL in Go.
+
+#### Worker service (`internal/service/worker.go`)
+
+New background consumer:
+
+- `EventEnvelope` — mirrors the Redis JSON envelope (`client_id`, `event_type`, `payload`, `received_at`)
+- `Worker` — holds `queue.Queue` + `repository.EventStore`
+- `Run(ctx)` — infinite loop: `Dequeue` → `processOne`
+- `processOne` — unmarshal envelope → `store.CreateEvent` with `pgtype.Timestamptz`
+
+#### Worker entrypoint (`cmd/worker/main.go`)
+
+Separate binary from the HTTP API:
+
+```
+config.Load()
+  → pgxpool.New(PostgresDSN)
+  → queue.NewRedisQueue
+  → repository.NewPostgresEventStore
+  → service.NewWorker
+  → worker.Run
+```
+
+Run API and worker as two processes for the full ingest → persist path.
+
+#### End-to-end flow (Day 1–4)
+
+```
+POST /v1/events → Redis list (LPUSH) → worker (BRPOP) → sqlc CreateEvent → events table
+```
+
+#### Still deferred
+
+- No `make sqlc` target — run `sqlc generate` manually after query/schema changes
+- Worker has no graceful shutdown (no signal handling / context cancel)
+- Bad JSON and DB failures are logged or dropped — no dead-letter queue or requeue
+- `Dequeue` errors are swallowed with `continue` (no ctx check on error path)
+- No worker or repository tests yet
+- `internal/server/` still unused
+
+#### Gotchas learned
+
+- **sqlc + goose** — point `schema` at migration files; sqlc reads the DDL, goose applies it at runtime
+- **`CreateEventParams.Payload` is `[]byte`** — pass `json.RawMessage` from the envelope directly; pgx maps it to JSONB
+- **`received_at` needs `pgtype.Timestamptz`** — sqlc generates pgx types, not plain `time.Time`, for nullable/timestamp columns
+- **`RETURNING *` vs explicit columns** — sqlc may emit a partial `Scan` if the table has columns not listed in RETURNING; keep query and migration in sync
+- **Separate `cmd/worker`** — same pattern as `cmd/vanguard`; `internal/` packages are shared, binaries are not
+- **FIFO** — `LPUSH` + `BRPOP` is the correct pair; do not `BRPOP` from the same end you push
+
+#### Day 4 commands (typical flow)
+
+```bash
+make up
+make migrate-up
+sqlc generate
+
+# terminal 1 — API
+make run
+
+# terminal 2 — worker
+go run ./cmd/worker
+
+curl -s -X POST http://localhost:8080/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"client_id":"test","event_type":"ping","payload":{"n":1}}'
+
+docker compose exec redis redis-cli LLEN vanguard:events:ingest
+
+docker compose exec postgres psql -U vanguard -d vanguard \
+  -c "SELECT id, client_id, event_type, status, received_at FROM events;"
+```
+
+---

@@ -13,8 +13,8 @@ import (
 func main() {
 	config := config.Load()
 
-	var q queue.Enqueuer
-	q = queue.NewRedisEnqueuer(config.RedisAddr, config.RedisListKey)
+	var q queue.Queue
+	q = queue.NewRedisQueue(config.RedisAddr, config.RedisListKey)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

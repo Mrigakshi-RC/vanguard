@@ -38,7 +38,7 @@ func (r *IngestRequest) BuildEnvelope() ([]byte, error) {
 	return envelope, nil
 }
 
-func (r *IngestRequest) Enqueue(ctx context.Context, q queue.Enqueuer) error {
+func (r *IngestRequest) Enqueue(ctx context.Context, q queue.Queue) error {
 	envelope, err := r.BuildEnvelope()
 	if err != nil {
 		return err
@@ -48,10 +48,10 @@ func (r *IngestRequest) Enqueue(ctx context.Context, q queue.Enqueuer) error {
 
 // The structural worker that connects handler to queue
 type IngestService struct {
-	q queue.Enqueuer
+	q queue.Queue
 }
 
-func NewIngestService(q queue.Enqueuer) *IngestService {
+func NewIngestService(q queue.Queue) *IngestService {
 	return &IngestService{q: q}
 }
 

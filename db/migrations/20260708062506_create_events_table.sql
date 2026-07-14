@@ -9,9 +9,7 @@ CREATE TABLE events (
     payload JSONB NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    processed_at TIMESTAMPTZ,
-    retry_count INT NOT NULL DEFAULT 0,
-    last_error TEXT
+    processed_at TIMESTAMPTZ
 );
 
 CREATE INDEX idx_events_status ON events (status); -- +for repeated status-level checks
