@@ -16,11 +16,9 @@ type RedisQueue struct {
 	listKey string
 }
 
-func NewRedisQueue(addr string, listKey string) *RedisQueue {
+func NewRedisQueue(client *redis.Client, listKey string) *RedisQueue {
 	return &RedisQueue{
-		redis: redis.NewClient(&redis.Options{
-			Addr: addr,
-		}),
+		redis:   client,
 		listKey: listKey,
 	}
 }

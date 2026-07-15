@@ -21,7 +21,7 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var req service.IngestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		WriteJSONError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 
@@ -30,14 +30,14 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var queueErr service.QueueError
 		switch {
 		case errors.As(err, &validationErr):
-			writeJSONError(w, http.StatusBadRequest, validationErr.Message)
+			WriteJSONError(w, http.StatusBadRequest, validationErr.Message)
 		case errors.As(err, &queueErr):
-			writeJSONError(w, http.StatusServiceUnavailable, "service temporarily unavailable")
+			WriteJSONError(w, http.StatusServiceUnavailable, "service temporarily unavailable")
 		default:
-			writeJSONError(w, http.StatusInternalServerError, "internal server error")
+			WriteJSONError(w, http.StatusInternalServerError, "internal server error")
 		}
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
+	WriteJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
 }

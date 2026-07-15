@@ -9,6 +9,7 @@ import (
 	"github.com/Mrigakshi-RC/vanguard/internal/repository"
 	"github.com/Mrigakshi-RC/vanguard/internal/service"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -21,7 +22,10 @@ func main() {
 	}
 	defer dbPool.Close()
 
-	redisQueue := queue.NewRedisQueue(cfg.RedisAddr, cfg.RedisListKey)
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: cfg.RedisAddr,
+	})
+	redisQueue := queue.NewRedisQueue(redisClient, cfg.RedisListKey)
 
 	store := repository.NewPostgresEventStore(dbPool)
 	worker := service.NewWorker(redisQueue, store)

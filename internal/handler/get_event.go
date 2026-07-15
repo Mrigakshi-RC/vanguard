@@ -20,7 +20,7 @@ func (h *GetEventHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	id := r.PathValue("id")
 	if id == "" {
-		writeJSONError(w, http.StatusBadRequest, "event id is required")
+		WriteJSONError(w, http.StatusBadRequest, "event id is required")
 		return
 	}
 
@@ -28,14 +28,14 @@ func (h *GetEventHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrInvalidEventID):
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			WriteJSONError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, service.ErrEventNotFound):
-			writeJSONError(w, http.StatusNotFound, err.Error())
+			WriteJSONError(w, http.StatusNotFound, err.Error())
 		default:
-			writeJSONError(w, http.StatusInternalServerError, "internal server error")
+			WriteJSONError(w, http.StatusInternalServerError, "internal server error")
 		}
 		return
 	}
 
-	writeJSON(w, http.StatusOK, event)
+	WriteJSON(w, http.StatusOK, event)
 }

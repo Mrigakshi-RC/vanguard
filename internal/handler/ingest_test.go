@@ -102,7 +102,7 @@ func TestIngestHandler(t *testing.T) {
 
 func TestWriteJSONError_escapesQuotes(t *testing.T) {
 	rec := httptest.NewRecorder()
-	writeJSONError(rec, http.StatusBadRequest, `bad "input"`)
+	WriteJSONError(rec, http.StatusBadRequest, `bad "input"`)
 
 	var body map[string]string
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {

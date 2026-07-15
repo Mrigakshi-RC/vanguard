@@ -406,3 +406,136 @@ docker compose exec postgres psql -U vanguard -d vanguard \
 ```
 
 ---
+
+### Day 5 — 2026-07-15
+
+**Goal:** Add IP-keyed token-bucket rate limiting on `POST /v1/events` using Redis, return 429 on breach, and introduce the project's first HTTP middleware.
+
+#### Config (`internal/config/config.go`)
+
+Extended `Config` with rate-limit env vars (not fully wired in `main` yet — see gotchas):
+
+| Field | Env var | Default |
+|-------|---------|---------|
+| `RateLimitRate` | `VANGUARD_RATE_LIMIT_RATE` | `10` |
+| `RateLimitCapacity` | `VANGUARD_RATE_LIMIT_CAPACITY` | `100` |
+| `RateLimitEnabled` | `VANGUARD_RATE_LIMIT_ENABLED` | `false` |
+
+Added `envAsInt()` and `envAsBool()` helpers alongside the existing `envOr()`.
+
+#### Shared Redis client (`internal/queue/redis.go`, `cmd/vanguard/main.go`, `cmd/worker/main.go`)
+
+Refactored so each binary creates one `*redis.Client` and passes it in, instead of `NewRedisQueue` opening its own connection pool:
+
+- `NewRedisQueue(client *redis.Client, listKey string)` — signature change from Day 4's `(addr, listKey)`
+- API and worker each construct a client in `main` and share it between the queue and (on the API side) the rate limiter
+
+#### Token-bucket limiter (`internal/ratelimit/`)
+
+New package for Redis-backed rate limiting:
+
+- `Limiter` — holds `*redis.Client`, `rate`, and `capacity`
+- `Allow(ctx, key)` — runs an atomic Lua script via `EVAL`, returns `(allowed, retryAfter, error)`
+- `token_bucket.lua` — lazy-refill token bucket stored in a Redis hash (`tokens`, `last_updated`); refills based on elapsed time, deducts 1 token per request, sets key TTL
+- Script embedded with `//go:embed token_bucket.lua`
+
+Redis key shape (built in middleware): `rate_limit:events:{clientIP}`.
+
+#### Rate-limit middleware (`internal/middleware/ratelimit.go`)
+
+First middleware in the project — stdlib `http.Handler` wrapping:
+
+- `AllowLimiter` interface — `Allow(ctx, key) (bool, int, error)` so tests can stub without Redis
+- `RateLimitMiddleware(limiter)` — returns a middleware function that wraps the next handler
+- Extracts client IP from `r.RemoteAddr` (strips port via `net.SplitHostPort`)
+- **Allowed** → passes through to the ingest handler
+- **Denied** → `429 Too Many Requests` + `{"error":"Too many requests, retry after N"}`
+- **Redis error** → fail open (log + allow request through)
+
+Only `POST /v1/events` is wrapped; `GET /v1/events/{id}` is unchanged.
+
+#### Handler export (`internal/handler/response.go`)
+
+Renamed `writeJSONError` → `WriteJSONError` (exported) so middleware can reuse the same JSON error format as handlers.
+
+#### App wiring (`cmd/vanguard/main.go`)
+
+Updated dependency chain:
+
+```
+config.Load()
+  → pgxpool.New(PostgresDSN)
+  → redis.NewClient(RedisAddr)          # one shared client
+  → queue.NewRedisQueue(client, listKey)
+  → ratelimit.NewLimiter(client, rate, capacity)
+  → RateLimitMiddleware(limiter)(ingestHandler)
+  → server.New → ListenAndServe
+```
+
+Currently `main` hardcodes `rate=10, capacity=20` for the limiter instead of reading `cfg.RateLimitRate` / `cfg.RateLimitCapacity` / `cfg.RateLimitEnabled`.
+
+#### Tests added
+
+| File | Covers |
+|------|--------|
+| `internal/middleware/ratelimit_test.go` | Stub limiter: allow pass-through, deny → 429, Redis error → fail open |
+| `internal/ratelimit/limiter_test.go` | Token bucket with miniredis: 2 allowed, 3rd denied with `retryAfter=1` |
+
+Added `github.com/alicebob/miniredis/v2` as a test dependency for in-memory Redis (no Docker needed in unit tests).
+
+#### End-to-end flow (ingest path)
+
+```
+POST /v1/events
+  → RateLimitMiddleware (Redis token bucket, keyed by IP)
+  → IngestHandler → IngestService → RedisQueue (LPUSH)
+  → worker (BRPOP) → Postgres
+```
+
+#### Still deferred
+
+- Wire `VANGUARD_RATE_LIMIT_*` env vars into `main` (replace hardcoded `5, 10`)
+- Respect `VANGUARD_RATE_LIMIT_ENABLED` toggle
+- `Retry-After` as an HTTP response header (currently only in the JSON error message)
+- Real client IP behind a reverse proxy (`X-Forwarded-For` / trusted proxy list)
+- Load-test script (e.g. 200 req/s to confirm 429s at threshold)
+- Config tests for rate-limit env vars
+- Graceful shutdown, retry/backoff, DLQ (carried over from Day 4)
+
+#### Gotchas learned
+
+- **Middleware is just handler wrapping** — `func(http.Handler) http.Handler`; no framework needed
+- **Rate limit before the handler** — check the bucket before JSON decode / service work
+- **Lua script must be embedded** — `//go:embed` loads `token_bucket.lua` at compile time; without it `tokenBucketScript` is empty and `EVAL` fails
+- **One Redis client per process** — queue and limiter share a connection pool; worker keeps its own client (separate binary)
+- **`RemoteAddr` includes the port** — use `net.SplitHostPort` before using IP as the rate-limit key
+- **Fail open vs fail closed** — Redis errors on the limiter allow traffic through; queue errors on ingest still return 503
+- **miniredis for tests** — runs Lua `EVAL` in-process; good for unit tests without `make up`
+- **Interface at the middleware boundary** — `AllowLimiter` enables stub tests; `*ratelimit.Limiter` satisfies it
+
+#### Day 5 commands (typical flow)
+
+```bash
+make up
+make migrate-up
+make test
+
+# terminal 1 — API (rate limit active, hardcoded 5/s rate, 10 capacity)
+make run
+
+# terminal 2 — worker
+make worker
+
+# send requests until you hit 429
+for i in $(seq 1 15); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8080/v1/events \
+    -H 'Content-Type: application/json' \
+    -d '{"client_id":"test","event_type":"ping","payload":{"n":1}}'
+done
+
+# inspect rate-limit keys in Redis
+docker compose exec redis redis-cli KEYS 'rate_limit:events:*'
+docker compose exec redis redis-cli HGETALL 'rate_limit:events:127.0.0.1:<port>'
+```
+
+---
