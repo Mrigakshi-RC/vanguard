@@ -539,3 +539,104 @@ docker compose exec redis redis-cli HGETALL 'rate_limit:events:127.0.0.1:<port>'
 ```
 
 ---
+
+### Day 6 — 2026-07-16
+
+**Goal:** Validate rate limiting under load with a scripted benchmark, and start graceful HTTP shutdown so in-flight requests can drain on SIGTERM/SIGINT.
+
+#### Graceful shutdown (`cmd/vanguard/main.go`)
+
+Replaced bare `http.ListenAndServe` with an explicit `http.Server` and signal-driven shutdown:
+
+- `server.New(r Routes)` → assigned to a mux handler, then wrapped in `&http.Server{Addr, Handler}`
+- `signal.Notify` on `os.Interrupt` and `syscall.SIGTERM`
+- `httpServer.Shutdown` with a 5-second context timeout after a stop signal
+- Treats `http.ErrServerClosed` as a clean exit from `ListenAndServe`
+
+Intended flow:
+
+```
+ListenAndServe (background)
+  → SIGINT / SIGTERM
+  → Shutdown(5s timeout)
+  → drain in-flight HTTP, then exit
+```
+
+#### Load test script (`scripts/loadtest.go`)
+
+New standalone benchmark to stress the ingest path and confirm 429s appear when the token bucket is exceeded:
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `targetRPS` | `200` | Steady send rate via `time.Ticker` |
+| `testDuration` | `30s` | Total run time (cancellable early) |
+| `targetUrl` | `POST http://localhost:8080/v1/events` | Hits the rate-limited ingest route |
+| `clientTimeout` | `2s` | Per-request HTTP client timeout |
+
+Behavior:
+
+- Fires one goroutine per tick at the target RPS
+- Counts responses: `202`/`200`/`201` (allowed), `429` (rate limited), `5xx`, connection/other errors
+- Supports `Ctrl+C` / SIGTERM — cancels context and prints partial results
+- Reuses idle connections (`MaxIdleConnsPerHost: 100`) to avoid client-side bottlenecks
+
+#### Makefile addition
+
+| Target | Purpose |
+|--------|---------|
+| `make load-test` | Run `go run scripts/loadtest.go` against a live API |
+
+#### End-to-end validation flow
+
+```
+make run          # start API server with rate limit (10/s, capacity 20)
+make worker       # drain queue → Postgres
+
+make load-test    # 200 req/s × 30s → expect mix of 202 and 429
+```
+
+With the Day 5 limiter settings (`rate=10`, `capacity=20`), most requests above the refill rate should return `429 Too Many Requests` once the bucket empties.
+
+#### Still deferred
+
+- Fix graceful-shutdown wiring — `ListenAndServe` currently blocks the main goroutine before `signal.Notify` runs; move server start to a background goroutine so SIGTERM can trigger `Shutdown` while the process is healthy
+- Wire `VANGUARD_RATE_LIMIT_*` env vars into `main` (still hardcoded `10, 20`)
+- Respect `VANGUARD_RATE_LIMIT_ENABLED` toggle
+- `Retry-After` as an HTTP response header (currently only in the JSON error body)
+- Real client IP behind a reverse proxy (`X-Forwarded-For` / trusted proxy list)
+- Config tests for rate-limit env vars
+- Worker graceful shutdown (API only so far)
+- Retry + backoff, DLQ (carried over from Day 4)
+
+#### Gotchas learned
+
+- **`ListenAndServe` blocks** — signal handlers must be registered *before* or *alongside* a goroutine-started server; calling `ListenAndServe` on the main thread means shutdown code below it never runs until the server already stopped
+- **Load test needs a running API** — `make load-test` does not start the server; run `make run` (and ideally `make worker`) first
+- **429s are the success signal in a rate-limit test** — a high `429` count under 200 req/s confirms the middleware is doing its job, not that the system is broken
+- **Variable shadowing in `main`** — `handler := server.New(...)` shadows the imported `handler` package; rename to `mux` or `srv` to avoid confusion
+- **Load-test payload omits `client_id`** — requests will return `400` unless the script is updated; use a valid `IngestRequest` body to exercise the full ingest → queue path
+
+#### Day 6 commands (typical flow)
+
+```bash
+make up
+make migrate-up
+
+# terminal 1 — API
+make run
+
+# terminal 2 — worker
+make worker
+
+# terminal 3 — load test (200 req/s, 30s)
+make load-test
+
+# quick manual burst to see 429s
+for i in $(seq 1 25); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8080/v1/events \
+    -H 'Content-Type: application/json' \
+    -d '{"client_id":"load","event_type":"ping","payload":{"n":1}}'
+done
+```
+
+---

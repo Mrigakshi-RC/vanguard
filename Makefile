@@ -35,3 +35,13 @@ worker:
 
 sqlc:
 	sqlc generate
+
+# ============================================================================
+# PERFORMANCE & RATE LIMIT TESTING
+# ============================================================================
+
+.PHONY: load-test 
+
+load-test:
+	@echo "Validating environment and running performance test..."
+	@go run scripts/loadtest.go

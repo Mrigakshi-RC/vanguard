@@ -4,6 +4,10 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/Mrigakshi-RC/vanguard/internal/config"
 	"github.com/Mrigakshi-RC/vanguard/internal/handler"
@@ -45,14 +49,34 @@ func main() {
 	eventService := service.NewEventService(eventStore)
 	getEventHandler := handler.NewGetEventHandler(eventService)
 
-	srv := server.New(server.Routes{
+	handler := server.New(server.Routes{
 		Ingest:   protectedIngestHandler,
 		GetEvent: getEventHandler,
 	})
+	httpServer := &http.Server{
+		Addr:    cfg.HTTPAddr,
+		Handler: handler,
+	}
 
 	log.Printf("Server starting on %s...", cfg.HTTPAddr)
-	err = http.ListenAndServe(cfg.HTTPAddr, srv)
-	if err != nil {
-		log.Fatalf("Server failed to start: %v", err)
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server failed: %v", err)
 	}
+
+	// Shutdown gracefully
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	//listening on the main thread since the server is running in a background goroutine
+	<-stop
+	log.Println("Shutting down server gracefully...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Server gracefully stopped. Zero active connections left.")
 }
