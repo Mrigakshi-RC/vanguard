@@ -640,3 +640,174 @@ done
 ```
 
 ---
+
+### Day 7 — 2026-07-18
+
+**Goal:** Add worker retry with exponential backoff on transient Postgres failures, requeue exhausted retries back to Redis, route permanent/malformed events to a dead-letter queue, and fix the malformed-envelope data-loss bug from Day 4.
+
+#### Config (`internal/config/config.go`)
+
+Extended `Config` with retry and DLQ env vars:
+
+| Field | Env var | Default | Purpose |
+|-------|---------|---------|---------|
+| `RetryMaxAttempts` | `VANGUARD_RETRY_MAX_ATTEMPTS` | `5` | In-process DB insert attempts before requeue |
+| `RetryBaseDelay` | `VANGUARD_RETRY_BASE_DELAY` | `1` | Intended base backoff (seconds) — see gotchas |
+| `RetryMaxDelay` | `VANGUARD_RETRY_MAX_DELAY` | `30` | Max backoff cap (seconds) |
+| `RedisDLQKey` | `VANGUARD_REDIS_DLQ_KEY` | `vanguard:events:dlq` | Dead-letter Redis list |
+
+#### Queue (`internal/queue/redis.go`)
+
+Extended the `Queue` interface and `RedisQueue` implementation:
+
+- `Requeue(ctx, data)` — `LPUSH` back onto the main ingest list (`RedisListKey`); delegates to `Enqueue`
+- `EnqueueDLQ(ctx, data)` — `LPUSH` onto the DLQ list (`RedisDLQKey`)
+- `NewRedisQueue(client, listKey, dlqKey)` — signature change; both API and worker pass `cfg.RedisDLQKey`
+
+Redis key layout:
+
+| Key | Purpose |
+|-----|---------|
+| `vanguard:events:ingest` | Main queue (ingest + requeue) |
+| `vanguard:events:dlq` | Dead-letter queue (permanent/malformed failures) |
+
+#### Worker retry logic (`internal/service/worker.go`)
+
+Replaced log-and-drop with a structured failure path in `processOne`:
+
+1. **Malformed JSON** — log truncated body → `EnqueueDLQ` → `return` (fixes Day 4 bug where parse failure still attempted `CreateEvent`)
+2. **Transient DB error** — retry up to `RetryMaxAttempts` with exponential backoff (`1s → 2s → 4s → …`, capped at `RetryMaxDelay`)
+3. **Permanent DB error** — route to DLQ immediately (non-transient errors)
+4. **Exhausted retries** — `Requeue` raw message back to the main Redis list
+5. **Context cancelled during backoff** — requeue message so it is not lost mid-wait
+
+`isTransientError` classifies retryable failures by substring match: `connection`, `timeout`, `deadlock`, `eof`, `refused`.
+
+Worker log lines to watch during a Postgres outage:
+
+```
+Transient DB error: ... Retrying in 2s (Attempt 2/5)
+Database insertion failed after 5 attempts: ..., requeuing to Redis
+Permanent database error encountered: ... Routing to DLQ.
+```
+
+#### App wiring
+
+Both binaries updated for the new `NewRedisQueue` signature:
+
+- [`cmd/vanguard/main.go`](cmd/vanguard/main.go) — passes `cfg.RedisDLQKey` (API only enqueues; DLQ unused on ingest path)
+- [`cmd/worker/main.go`](cmd/worker/main.go) — passes `cfg.RedisDLQKey` for worker DLQ writes
+
+#### Tests
+
+| File | Covers |
+|------|--------|
+| `internal/handler/ingest_test.go` | `stubQueue` updated with `Requeue` + `EnqueueDLQ` to satisfy extended `Queue` interface |
+
+No dedicated worker retry unit tests yet (fake store that fails N times still deferred).
+
+#### End-to-end flow (worker path)
+
+```
+POST /v1/events → Redis (LPUSH ingest list)
+  → worker (BRPOP)
+  → CreateEvent
+      ├─ success → done
+      ├─ transient error → backoff retry (up to N attempts)
+      ├─ exhausted retries → Requeue (LPUSH ingest list)
+      ├─ permanent error → EnqueueDLQ (LPUSH dlq list)
+      └─ malformed JSON → EnqueueDLQ
+```
+
+#### Manual proof test — Postgres outage with zero data loss
+
+Reset to a clean baseline, then kill Postgres mid-run:
+
+```bash
+make up
+make migrate-up
+
+# clean slate
+docker compose exec postgres psql -U vanguard -d vanguard -c "TRUNCATE events;"
+docker compose exec redis redis-cli DEL vanguard:events:ingest
+docker compose exec redis redis-cli DEL vanguard:events:dlq
+
+# terminal 1 — API
+make run
+
+# terminal 2 — worker
+make worker
+
+# terminal 3 — steady ingest (~5 req/s)
+for i in $(seq 1 100); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8080/v1/events \
+    -H 'Content-Type: application/json' \
+    -d "{\"client_id\":\"proof\",\"event_type\":\"ping\",\"payload\":{\"n\":$i}}"
+  sleep 0.2
+done | tee /tmp/codes.txt
+
+# terminal 4 — kill Postgres WHILE terminal 3 is still running
+docker compose stop postgres
+sleep 10
+docker compose start postgres
+
+# verify (N = number of 202 responses)
+grep -c '^202$' /tmp/codes.txt
+docker compose exec redis redis-cli LLEN vanguard:events:ingest   # expect 0 after drain
+docker compose exec redis redis-cli LLEN vanguard:events:dlq       # expect 0
+docker compose exec postgres psql -U vanguard -d vanguard \
+  -c "SELECT count(*) FROM events;"                               # expect = N
+```
+
+**Before Day 7:** row count was less than the number of `202` responses after a mid-run outage (events popped from Redis were logged and dropped).
+
+**After Day 7:** queue drains after Postgres recovery; `SELECT count(*)` should match the `202` count; DLQ should be empty for a clean run.
+
+#### Still deferred
+
+- Wire `RetryBaseDelay` into the backoff calculation (currently hardcoded `1<<retryCount` seconds)
+- Inject retry config into `Worker` at construction instead of calling `config.Load()` inside `processOne`
+- Worker retry unit tests (fake `EventStore` that fails N times)
+- Config tests for retry/DLQ env vars
+- Worker graceful shutdown (API only so far)
+- Dedicated retry/DLQ consumer or admin tooling to inspect DLQ contents
+- Rate-limit env wiring, graceful-shutdown goroutine fix (carried over from Day 6)
+
+#### Gotchas learned
+
+- **Requeue uses the same key as ingest** — `Requeue` is not a separate list; it `LPUSH`es back onto `vanguard:events:ingest`
+- **BRPOP is destructive** — retry/requeue only helps if the message is still in memory or explicitly pushed back; the old code lost events at the first failed insert
+- **Kill Postgres during ingest, not after** — stopping Postgres after a finished load test does not exercise the retry path; the outage must overlap with active worker writes
+- **Clean baseline makes proof easier** — `TRUNCATE events` + `DEL` Redis keys avoids confusing old rows with the current test run
+- **`make up` before `make worker`** — if Redis is down, the worker tight-loops on `Dequeue` errors and floods the terminal with `connection refused`
+- **`RetryBaseDelay` config exists but is unused** — backoff currently uses `1<<retryCount` seconds regardless of the env var
+- **Transient detection is string-based** — `isTransientError` matches substrings in the error message; refine as you encounter real pgx error types
+
+#### Day 7 commands (typical flow)
+
+```bash
+make up
+make migrate-up
+make test
+
+# terminal 1 — API
+make run
+
+# terminal 2 — worker
+make worker
+
+# ingest one event
+curl -s -X POST http://localhost:8080/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"client_id":"test","event_type":"ping","payload":{"n":1}}'
+
+# inspect queues
+docker compose exec redis redis-cli LLEN vanguard:events:ingest
+docker compose exec redis redis-cli LLEN vanguard:events:dlq
+
+# confirm row landed
+docker compose exec postgres psql -U vanguard -d vanguard \
+  -c "SELECT id, client_id, event_type, status FROM events ORDER BY received_at DESC LIMIT 5;"
+```
+
+---

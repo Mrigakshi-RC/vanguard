@@ -35,7 +35,7 @@ func main() {
 		Addr: cfg.RedisAddr,
 	})
 
-	redisQueue := queue.NewRedisQueue(redisClient, cfg.RedisListKey)
+	redisQueue := queue.NewRedisQueue(redisClient, cfg.RedisListKey, cfg.RedisDLQKey)
 	eventStore := repository.NewPostgresEventStore(dbPool)
 
 	limiter := ratelimit.NewLimiter(redisClient, 10, 20)

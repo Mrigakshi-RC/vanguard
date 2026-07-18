@@ -25,7 +25,7 @@ func main() {
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
 	})
-	redisQueue := queue.NewRedisQueue(redisClient, cfg.RedisListKey)
+	redisQueue := queue.NewRedisQueue(redisClient, cfg.RedisListKey, cfg.RedisDLQKey)
 
 	store := repository.NewPostgresEventStore(dbPool)
 	worker := service.NewWorker(redisQueue, store)

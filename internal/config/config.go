@@ -13,6 +13,10 @@ type Config struct {
 	RateLimitRate     int
 	RateLimitCapacity int
 	RateLimitEnabled  bool
+	RetryMaxAttempts  int
+	RetryBaseDelay    int
+	RetryMaxDelay     int
+	RedisDLQKey       string
 }
 
 func Load() Config {
@@ -24,6 +28,10 @@ func Load() Config {
 		RateLimitRate:     envAsInt("VANGUARD_RATE_LIMIT_RATE", 10),
 		RateLimitCapacity: envAsInt("VANGUARD_RATE_LIMIT_CAPACITY", 100),
 		RateLimitEnabled:  envAsBool("VANGUARD_RATE_LIMIT_ENABLED", false),
+		RetryMaxAttempts:  envAsInt("VANGUARD_RETRY_MAX_ATTEMPTS", 5),
+		RetryBaseDelay:    envAsInt("VANGUARD_RETRY_BASE_DELAY", 1),
+		RetryMaxDelay:     envAsInt("VANGUARD_RETRY_MAX_DELAY", 30),
+		RedisDLQKey:       envOr("VANGUARD_REDIS_DLQ_KEY", "vanguard:events:dlq"),
 	}
 }
 

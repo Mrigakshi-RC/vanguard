@@ -9,17 +9,21 @@ import (
 type Queue interface {
 	Enqueue(ctx context.Context, data []byte) error
 	Dequeue(ctx context.Context) ([]byte, error)
+	Requeue(ctx context.Context, data []byte) error
+	EnqueueDLQ(ctx context.Context, data []byte) error
 }
 
 type RedisQueue struct {
 	redis   *redis.Client
 	listKey string
+	dlqKey  string
 }
 
-func NewRedisQueue(client *redis.Client, listKey string) *RedisQueue {
+func NewRedisQueue(client *redis.Client, listKey string, dlqKey string) *RedisQueue {
 	return &RedisQueue{
 		redis:   client,
 		listKey: listKey,
+		dlqKey:  dlqKey,
 	}
 }
 
@@ -34,4 +38,12 @@ func (r *RedisQueue) Dequeue(ctx context.Context) ([]byte, error) {
 	}
 	// result[0] = key, result[1] = value
 	return []byte(result[1]), nil
+}
+
+func (r *RedisQueue) Requeue(ctx context.Context, data []byte) error {
+	return r.Enqueue(ctx, data)
+}
+
+func (r *RedisQueue) EnqueueDLQ(ctx context.Context, data []byte) error {
+	return r.redis.LPush(ctx, r.dlqKey, data).Err()
 }

@@ -24,6 +24,14 @@ func (s stubQueue) Dequeue(ctx context.Context) ([]byte, error) {
 	return nil, nil
 }
 
+func (s stubQueue) Requeue(ctx context.Context, data []byte) error {
+	return s.err
+}
+
+func (s stubQueue) EnqueueDLQ(ctx context.Context, data []byte) error {
+	return s.err
+}
+
 func TestIngestHandler(t *testing.T) {
 	tests := []struct {
 		name       string
