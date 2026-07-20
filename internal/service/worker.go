@@ -70,7 +70,7 @@ func (w *Worker) processOne(ctx context.Context, data []byte) {
 			},
 		})
 		if dbErr == nil {
-			break
+			return
 		}
 		if !isTransientError(dbErr) {
 			log.Printf("Permanent database error encountered: %v. Routing to DLQ.", dbErr)
@@ -82,9 +82,7 @@ func (w *Worker) processOne(ctx context.Context, data []byte) {
 		if retryCount < cfg.RetryMaxAttempts-1 {
 			delay := time.Duration(1<<uint(retryCount)) * time.Second
 			maxDelay := time.Duration(cfg.RetryMaxDelay) * time.Second
-			if delay > maxDelay*time.Second {
-				delay = maxDelay * time.Second
-			}
+			delay = min(delay, maxDelay)
 
 			log.Printf("Transient DB error: %v. Retrying in %v (Attempt %d/%d)", dbErr, delay, retryCount+1, cfg.RetryMaxAttempts)
 
@@ -122,7 +120,7 @@ func (w *Worker) sendToDLQ(ctx context.Context, data []byte) error {
 
 func isTransientError(err error) bool {
 	errMsg := err.Error()
-	for _, substring := range []string{"connection", "timeout", "deadlock", "eof", "refused"} {
+	for _, substring := range []string{"connection", "timeout", "deadlock", "eof", "refused", "starting up"} {
 		if strings.Contains(errMsg, substring) {
 			return true
 		}

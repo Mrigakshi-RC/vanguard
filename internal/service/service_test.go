@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -106,4 +107,77 @@ func (s stubEventStore) GetEventByID(ctx context.Context, id pgtype.UUID) (db.Ev
 		Status:     "pending",
 		ReceivedAt: pgtype.Timestamptz{Time: receivedAt, Valid: true},
 	}, nil
+}
+
+type failingEventStore struct {
+	failCount int
+	failErr   error
+	calls     int
+}
+
+func (s *failingEventStore) CreateEvent(ctx context.Context, arg db.CreateEventParams) (db.Event, error) {
+	s.calls++
+	if s.calls <= s.failCount {
+		return db.Event{}, s.failErr
+	}
+	return db.Event{}, nil
+}
+func (s *failingEventStore) GetEventByID(ctx context.Context, id pgtype.UUID) (db.Event, error) {
+	return db.Event{}, nil
+}
+
+type recordingQueue struct {
+	requeued int
+	dlq      int
+}
+
+func (q *recordingQueue) Enqueue(ctx context.Context, data []byte) error    { return nil }
+func (q *recordingQueue) Dequeue(ctx context.Context) ([]byte, error)       { return nil, nil }
+func (q *recordingQueue) Requeue(ctx context.Context, data []byte) error    { q.requeued++; return nil }
+func (q *recordingQueue) EnqueueDLQ(ctx context.Context, data []byte) error { q.dlq++; return nil }
+
+func validEnvelope(t *testing.T) []byte {
+	t.Helper()
+	b, err := json.Marshal(IngestRequest{
+		ClientID: "acme", EventType: "ping", Payload: json.RawMessage(`{"n":1}`),
+	}.ToEnvelope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestWorker_malformedJSONGoesToDLQ(t *testing.T) {
+	q := &recordingQueue{}
+	store := &failingEventStore{}
+
+	NewWorker(q, store).processOne(context.Background(), []byte("{bad"))
+
+	if store.calls != 0 || q.dlq != 1 || q.requeued != 0 {
+		t.Fatalf("calls=%d dlq=%d requeued=%d", store.calls, q.dlq, q.requeued)
+	}
+}
+
+func TestWorker_retriesThenSucceeds(t *testing.T) {
+	store := &failingEventStore{failCount: 2, failErr: errors.New("connection refused")}
+	q := &recordingQueue{}
+
+	NewWorker(q, store).processOne(context.Background(), validEnvelope(t))
+
+	if store.calls != 3 || q.requeued != 0 || q.dlq != 0 {
+		t.Fatalf("calls=%d requeued=%d dlq=%d", store.calls, q.requeued, q.dlq)
+	}
+}
+
+func TestWorker_exhaustedRetriesRequeue(t *testing.T) {
+	t.Setenv("VANGUARD_RETRY_MAX_ATTEMPTS", "2")
+
+	store := &failingEventStore{failCount: 10, failErr: errors.New("connection refused")}
+	q := &recordingQueue{}
+
+	NewWorker(q, store).processOne(context.Background(), validEnvelope(t))
+
+	if store.calls != 2 || q.requeued != 1 || q.dlq != 0 {
+		t.Fatalf("calls=%d requeued=%d dlq=%d", store.calls, q.requeued, q.dlq)
+	}
 }

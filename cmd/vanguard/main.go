@@ -38,13 +38,14 @@ func main() {
 	redisQueue := queue.NewRedisQueue(redisClient, cfg.RedisListKey, cfg.RedisDLQKey)
 	eventStore := repository.NewPostgresEventStore(dbPool)
 
-	limiter := ratelimit.NewLimiter(redisClient, 10, 20)
-	limiterMiddleware := middleware.RateLimitMiddleware(limiter)
-
 	ingestService := service.NewIngestService(redisQueue)
 	ingestHandler := handler.NewIngestHandler(ingestService)
 
-	protectedIngestHandler := limiterMiddleware(ingestHandler)
+	var protectedIngestHandler http.Handler = ingestHandler
+	if cfg.RateLimitEnabled {
+		limiter := ratelimit.NewLimiter(redisClient, cfg.RateLimitRate, cfg.RateLimitCapacity)
+		protectedIngestHandler = middleware.RateLimitMiddleware(limiter)(ingestHandler)
+	}
 
 	eventService := service.NewEventService(eventStore)
 	getEventHandler := handler.NewGetEventHandler(eventService)

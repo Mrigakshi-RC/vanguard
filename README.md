@@ -413,13 +413,13 @@ docker compose exec postgres psql -U vanguard -d vanguard \
 
 #### Config (`internal/config/config.go`)
 
-Extended `Config` with rate-limit env vars (not fully wired in `main` yet — see gotchas):
+Extended `Config` with rate-limit env vars:
 
 | Field | Env var | Default |
 |-------|---------|---------|
 | `RateLimitRate` | `VANGUARD_RATE_LIMIT_RATE` | `10` |
-| `RateLimitCapacity` | `VANGUARD_RATE_LIMIT_CAPACITY` | `100` |
-| `RateLimitEnabled` | `VANGUARD_RATE_LIMIT_ENABLED` | `false` |
+| `RateLimitCapacity` | `VANGUARD_RATE_LIMIT_CAPACITY` | `20` |
+| `RateLimitEnabled` | `VANGUARD_RATE_LIMIT_ENABLED` | `true` |
 
 Added `envAsInt()` and `envAsBool()` helpers alongside the existing `envOr()`.
 
@@ -467,12 +467,12 @@ config.Load()
   → pgxpool.New(PostgresDSN)
   → redis.NewClient(RedisAddr)          # one shared client
   → queue.NewRedisQueue(client, listKey)
-  → ratelimit.NewLimiter(client, rate, capacity)
-  → RateLimitMiddleware(limiter)(ingestHandler)
+  → ratelimit.NewLimiter(client, cfg.RateLimitRate, cfg.RateLimitCapacity)
+  → RateLimitMiddleware(limiter)(ingestHandler)   # when cfg.RateLimitEnabled
   → server.New → ListenAndServe
 ```
 
-Currently `main` hardcodes `rate=10, capacity=20` for the limiter instead of reading `cfg.RateLimitRate` / `cfg.RateLimitCapacity` / `cfg.RateLimitEnabled`.
+Rate limiting reads from config (`rate=10`, `capacity=20` by default). Set `VANGUARD_RATE_LIMIT_ENABLED=false` to disable.
 
 #### Tests added
 
@@ -494,12 +494,10 @@ POST /v1/events
 
 #### Still deferred
 
-- Wire `VANGUARD_RATE_LIMIT_*` env vars into `main` (replace hardcoded `5, 10`)
-- Respect `VANGUARD_RATE_LIMIT_ENABLED` toggle
 - `Retry-After` as an HTTP response header (currently only in the JSON error message)
 - Real client IP behind a reverse proxy (`X-Forwarded-For` / trusted proxy list)
 - Load-test script (e.g. 200 req/s to confirm 429s at threshold)
-- Config tests for rate-limit env vars
+- Config tests for rate-limit env var overrides
 - Graceful shutdown, retry/backoff, DLQ (carried over from Day 4)
 
 #### Gotchas learned
@@ -520,7 +518,7 @@ make up
 make migrate-up
 make test
 
-# terminal 1 — API (rate limit active, hardcoded 5/s rate, 10 capacity)
+# terminal 1 — API (rate limit: 10/s, capacity 20)
 make run
 
 # terminal 2 — worker
@@ -600,11 +598,9 @@ With the Day 5 limiter settings (`rate=10`, `capacity=20`), most requests above 
 #### Still deferred
 
 - Fix graceful-shutdown wiring — `ListenAndServe` currently blocks the main goroutine before `signal.Notify` runs; move server start to a background goroutine so SIGTERM can trigger `Shutdown` while the process is healthy
-- Wire `VANGUARD_RATE_LIMIT_*` env vars into `main` (still hardcoded `10, 20`)
-- Respect `VANGUARD_RATE_LIMIT_ENABLED` toggle
 - `Retry-After` as an HTTP response header (currently only in the JSON error body)
 - Real client IP behind a reverse proxy (`X-Forwarded-For` / trusted proxy list)
-- Config tests for rate-limit env vars
+- Config tests for rate-limit env var overrides
 - Worker graceful shutdown (API only so far)
 - Retry + backoff, DLQ (carried over from Day 4)
 
@@ -771,7 +767,7 @@ docker compose exec postgres psql -U vanguard -d vanguard \
 - Config tests for retry/DLQ env vars
 - Worker graceful shutdown (API only so far)
 - Dedicated retry/DLQ consumer or admin tooling to inspect DLQ contents
-- Rate-limit env wiring, graceful-shutdown goroutine fix (carried over from Day 6)
+- Graceful-shutdown goroutine fix (carried over from Day 6)
 
 #### Gotchas learned
 
@@ -808,6 +804,124 @@ docker compose exec redis redis-cli LLEN vanguard:events:dlq
 # confirm row landed
 docker compose exec postgres psql -U vanguard -d vanguard \
   -c "SELECT id, client_id, event_type, status FROM events ORDER BY received_at DESC LIMIT 5;"
+```
+
+---
+
+### Day 8 — 2026-07-20
+
+**Goal:** Harden Day 7 retry logic with bug fixes found by unit tests and the Phase 5 outage proof test, add worker retry tests, document failure behavior, and validate zero silent data loss under a mid-run Postgres outage.
+
+#### Rate limit config alignment (`internal/config/config.go`, `cmd/vanguard/main.go`)
+
+Aligned rate-limit defaults and wiring across the codebase:
+
+| Setting | Was | Now |
+|---------|-----|-----|
+| `RateLimitCapacity` default | `100` in config, `20` hardcoded in `main` | `20` everywhere |
+| `RateLimitEnabled` default | `false` in config, always on in `main` | `true`; `main` reads config and skips middleware when `false` |
+| `main` wiring | `NewLimiter(redisClient, 10, 20)` | `NewLimiter(redisClient, cfg.RateLimitRate, cfg.RateLimitCapacity)` |
+
+Added config default tests for rate (`10`), capacity (`20`), and enabled (`true`).
+
+#### Worker bug fixes (`internal/service/worker.go`)
+
+Three fixes on top of Day 7:
+
+1. **Success path no longer requeues** — `break` → `return` after a successful `CreateEvent`. Previously every inserted event also fell through to the requeue block (caught by `TestWorker_retriesThenSucceeds`).
+
+2. **Max backoff cap overflow** — replaced `maxDelay * time.Second` (double-applied duration, logged negative delays like `-1914857h...`) with `delay = min(delay, maxDelay)`.
+
+3. **Postgres startup treated as transient** — added `"starting up"` to `isTransientError` so `57P03` errors during container recovery retry/requeue instead of landing in the DLQ.
+
+Updated transient substrings: `connection`, `timeout`, `deadlock`, `eof`, `refused`, `starting up`.
+
+#### Worker unit tests (`internal/service/service_test.go`)
+
+Added fakes and three tests for `processOne`:
+
+| Test | Proves |
+|------|--------|
+| `TestWorker_malformedJSONGoesToDLQ` | Bad JSON → DLQ, no `CreateEvent` call |
+| `TestWorker_retriesThenSucceeds` | Transient fail twice → succeeds on 3rd attempt, no requeue |
+| `TestWorker_exhaustedRetriesRequeue` | Always fails → requeue after `RetryMaxAttempts` |
+
+Helpers: `failingEventStore` (fail first N inserts), `recordingQueue` (count requeue/DLQ calls), `validEnvelope(t)`.
+
+#### Failure Modes doc (`docs/Failure-Modes.md`)
+
+New internal reference (carried over from Day 4 deferred list) covering:
+
+- Ingest path failures (400 / 429 / 503 / 202 semantics)
+- Worker path (retry, requeue, DLQ, crash scenarios)
+- Read path (400 / 404 / 500)
+- Infrastructure failures (startup, WSL port conflict, Redis down)
+- Postgres outage expected behavior + debug checklist
+- Known gaps (idempotency, worker shutdown, DLQ replay)
+
+#### Phase 5 validation — Postgres outage proof test
+
+Ran `make load-test` (200 req/s × 30s) with `docker compose stop postgres` mid-run:
+
+| Metric | Value |
+|--------|-------|
+| Accepted (`202`) | 320 |
+| Rows in Postgres | 317 |
+| DLQ | 3 |
+| Ingest queue | 0 |
+
+All 320 events accounted for (317 + 3) — no silent data loss. The 3 DLQ entries were from `FATAL: the database system is starting up` before the Day 8 transient fix. Worker logs during outage showed the expected retry/requeue path (`connection reset by peer` → backoff → requeue).
+
+#### WSL Postgres port conflict (again)
+
+`make migrate-up` failed until native Postgres was stopped:
+
+```bash
+sudo systemctl stop postgresql   # unit is postgresql, not postgres, on this WSL setup
+make down && make up && make migrate-up
+```
+
+#### Still deferred
+
+- Wire `RetryBaseDelay` into backoff (still hardcoded `1<<retryCount` seconds)
+- Inject retry config into `Worker` at construction instead of `config.Load()` in `processOne`
+- Config tests for retry/DLQ env vars
+- Worker graceful shutdown
+- DLQ replay / alerting tooling
+- Graceful-shutdown goroutine fix (carried over from Day 6)
+
+#### Gotchas learned
+
+- **Unit tests catch real bugs** — success-path requeue was a production bug, not a test bug
+- **`maxDelay * time.Second` when maxDelay is already a `Duration`** — overflows; use `min(delay, maxDelay)`
+- **`postgresql` vs `postgres` systemd unit** — `systemctl stop postgres` failed on WSL; `stop postgresql` worked
+- **`starting up` is transient** — Postgres returns `57P03` briefly after `docker compose start`
+- **Verify all three stores** — `count(*) + LLEN dlq` should equal accepted count when debugging
+- **`202` ≠ persisted** — documented explicitly in Failure Modes doc for interview prep
+
+#### Day 8 commands (typical flow)
+
+```bash
+make up && make migrate-up
+make test
+go test ./internal/service/ -v -run TestWorker
+
+# terminal 1 — API
+make run
+
+# terminal 2 — worker
+make worker
+
+# terminal 3 — load test
+make load-test
+
+# terminal 4 — kill Postgres mid-run
+docker compose stop postgres && sleep 10 && docker compose start postgres
+
+# verify
+docker compose exec redis redis-cli LLEN vanguard:events:ingest
+docker compose exec redis redis-cli LLEN vanguard:events:dlq
+docker compose exec postgres psql -U vanguard -d vanguard -c "SELECT count(*) FROM events;"
 ```
 
 ---

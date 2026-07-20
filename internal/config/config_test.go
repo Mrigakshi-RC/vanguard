@@ -22,6 +22,15 @@ func TestLoad_defaults(t *testing.T) {
 	if cfg.PostgresDSN == "" {
 		t.Error("PostgresDSN is empty")
 	}
+	if cfg.RateLimitRate != 10 {
+		t.Errorf("RateLimitRate = %d, want 10", cfg.RateLimitRate)
+	}
+	if cfg.RateLimitCapacity != 20 {
+		t.Errorf("RateLimitCapacity = %d, want 20", cfg.RateLimitCapacity)
+	}
+	if !cfg.RateLimitEnabled {
+		t.Error("RateLimitEnabled = false, want true")
+	}
 }
 
 func TestLoad_envOverrides(t *testing.T) {
