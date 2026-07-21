@@ -49,14 +49,16 @@ func main() {
 
 	eventService := service.NewEventService(eventStore)
 	getEventHandler := handler.NewGetEventHandler(eventService)
+	healthHandler := handler.NewHealthHandler(dbPool, redisClient)
 
-	handler := server.New(server.Routes{
+	routes := server.New(server.Routes{
+		Health:   healthHandler,
 		Ingest:   protectedIngestHandler,
 		GetEvent: getEventHandler,
 	})
 	httpServer := &http.Server{
 		Addr:    cfg.HTTPAddr,
-		Handler: handler,
+		Handler: routes,
 	}
 
 	log.Printf("Server starting on %s...", cfg.HTTPAddr)

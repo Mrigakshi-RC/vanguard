@@ -925,3 +925,91 @@ docker compose exec postgres psql -U vanguard -d vanguard -c "SELECT count(*) FR
 ```
 
 ---
+
+### Day 9 — 2026-07-21
+
+**Goal:** Make the edge API and worker container-ready for local Kubernetes (Minikube) — split multi-stage Dockerfiles, add a health probe endpoint, and clean up Redis client usage so both binaries build into small, non-root images.
+
+#### Docker image split (`Dockerfile.edge`, `Dockerfile.worker`)
+
+Replaced the single root `Dockerfile` (edge-only) with two explicit multi-stage builds:
+
+| File | Builds | Entrypoint |
+|------|--------|------------|
+| `Dockerfile.edge` | `./cmd/vanguard` → `/usr/local/bin/vanguard` | `vanguard` |
+| `Dockerfile.worker` | `./cmd/worker` → `/usr/local/bin/worker` | `worker` |
+
+Both use the same pattern:
+
+- **Build stage** — `golang:1.26-alpine`; copy `go.mod` / `go.sum` first for layer cache; `go mod download`; then source
+- **Compile flags** — `CGO_ENABLED=0 GOOS=linux` and `-ldflags="-s -w"` (static binary, stripped symbols → smaller image)
+- **Runtime stage** — `alpine:3.21`, non-root `app` user
+
+**Why two files instead of one `Dockerfile` with build args:** independent tags (`vanguard-edge`, `vanguard-worker`), clearer Minikube/K8s manifests, and no ambiguity about which binary a plain `docker build` produces. The old root `Dockerfile` was removed to avoid drift.
+
+#### `.dockerignore`
+
+Added to keep build context lean:
+
+- `.git/`, `bin/`, `vendor/`, `.env`
+- `**/*_test.go` (tests not needed in production images)
+- `*.md` / `README.md`
+
+**Why:** smaller context uploads, better cache hits, and no accidental secrets from `.env`.
+
+#### Health check (`internal/handler/health.go`, `internal/server/server.go`, `cmd/vanguard/main.go`)
+
+Added `GET /healthz` for Kubernetes readiness/liveness probes:
+
+- `HealthHandler` takes the same dependencies as production wiring: `*pgxpool.Pool` and `*redis.Client` from `github.com/redis/go-redis/v9`
+- `Ping` Postgres and Redis; return `200` + `ok` when both are reachable, `500` with a short body when either is down
+- Registered on the mux in `server.New`; wired in `main` via `handler.NewHealthHandler(dbPool, redisClient)`
+
+**Why not import `internal/db`:** that package is sqlc-generated query code — it has no connection pool and no `Ping()`. The health handler must use the same live clients as the rest of the app.
+
+**Why before K8s manifests:** probes need a stable HTTP endpoint; adding it now avoids deploying pods that Kubernetes thinks are ready while Redis or Postgres is unreachable.
+
+#### Cleanup
+
+- Removed stray `worker` binary accidentally sitting at repo root (build artifact, not source)
+- Confirmed all runtime Redis usage stays on `github.com/redis/go-redis/v9 v9.21.0` (`miniredis/v2` remains test-only)
+
+#### Still deferred
+
+- Kubernetes manifests under `k8s/` (edge, worker, Redis Deployments/Services/ConfigMaps)
+- Minikube workflow (`eval $(minikube docker-env)`, `imagePullPolicy: Never`, Postgres on host via `host.minikube.internal`)
+- Makefile targets: `k8s-build`, `k8s-deploy`, `k8s-up`
+- Readiness probe semantics — consider `503` instead of `500` when deps are down (K8s convention)
+- Root `Dockerfile` alias for `docker build .` without `-f` (optional convenience)
+- Graceful-shutdown goroutine fix (carried over from Day 6)
+
+#### Gotchas learned
+
+- **`go build` flag order** — `-ldflags` must come **before** the package path (`go build -ldflags="..." -o out ./cmd/...`), not after
+- **Worker Dockerfile copy-paste** — easy to leave `./cmd/vanguard` and `ENTRYPOINT ["vanguard"]` in the worker file; build and run both images locally before pushing to K8s
+- **`internal/db` ≠ database connection** — sqlc's `db` package name collides mentally with "the DB"; health checks need `pgxpool` + `redis.Client`
+- **Two binaries ⇒ two images** — compose today only runs Postgres + Redis; the app processes still run on the host until K8s manifests land
+
+#### Day 9 commands (typical flow)
+
+```bash
+make up && make migrate-up
+
+# Build edge image
+docker build -f Dockerfile.edge -t vanguard-edge:latest .
+
+# Build worker image
+docker build -f Dockerfile.worker -t vanguard-worker:latest .
+
+# Run API locally and probe health
+make run
+curl -s http://localhost:8080/healthz    # expect: ok
+
+# Optional — smoke-test edge container against compose infra
+docker run --rm --network host \
+  -e VANGUARD_REDIS_ADDR=localhost:6379 \
+  -e VANGUARD_POSTGRES_DSN='postgres://vanguard:vanguard@localhost:5432/vanguard?sslmode=disable' \
+  vanguard-edge:latest
+```
+
+---

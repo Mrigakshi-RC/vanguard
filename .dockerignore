@@ -1,0 +1,13 @@
+# Version control
+.git
+.gitignore
+bin/
+vendor/
+.env
+
+#test files
+**/*_test.go
+
+# Docs / misc
+*.md
+README.md
