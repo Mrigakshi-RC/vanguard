@@ -1013,3 +1013,154 @@ docker run --rm --network host \
 ```
 
 ---
+
+### Day 10 — 2026-07-26
+
+**Goal:** Deploy edge, worker, and Redis to Minikube with plain Kubernetes manifests — same ingest → queue → worker → Postgres behavior as compose + `make run` / `make worker`, with Postgres staying on the host.
+
+#### Architecture on Minikube
+
+```
+POST /v1/events  →  edge Pod  →  Redis Service (redis:6379)
+                              ↘  host.minikube.internal:5432 (Postgres via compose)
+
+worker Pod  →  BRPOP redis  →  INSERT Postgres (host)
+GET /v1/events/{id}  →  edge Pod  →  Postgres (host)
+```
+
+| Component | Where it runs | Why |
+|-----------|---------------|-----|
+| **Postgres** | Host — `docker compose up postgres -d` | DB off-cluster (local dev); matches “don’t run Postgres in K8s” practice |
+| **Redis** | `k8s/redis/` | Queue + rate-limit cache; ephemeral, same role as compose Redis |
+| **Edge** | `k8s/edge/` | HTTP API with probes on `/healthz` |
+| **Worker** | `k8s/worker/` | Background consumer; no Service (nothing calls it inbound) |
+
+#### Kubernetes manifests (`k8s/`)
+
+```
+k8s/
+├── configmap.yaml           # shared VANGUARD_* env vars
+├── redis/
+│   ├── deployment.yaml      # redis:7, 1 replica
+│   └── service.yaml         # ClusterIP redis:6379
+├── edge/
+│   ├── deployment.yaml      # vanguard-edge:latest, probes, init container
+│   └── service.yaml         # NodePort 8080 (fixed nodePort 30080)
+└── worker/
+    └── deployment.yaml      # vanguard-worker:latest, init container
+```
+
+**ConfigMap (`vanguard-config`)** — mirrors [`internal/config/config.go`](internal/config/config.go):
+
+- `VANGUARD_REDIS_ADDR=redis:6379` — K8s Service DNS (not `localhost`)
+- `VANGUARD_POSTGRES_DSN=...@host.minikube.internal:5432/...` — reach host Postgres from pods
+- All numeric/boolean values **quoted** (`"10"`, `"true"`) — ConfigMap `data` values must be strings
+- `apiVersion: v1` — ConfigMaps are core `v1`, not `apps/v1`
+
+**Edge Deployment:**
+
+- `imagePullPolicy: Never` — images loaded into Minikube with `minikube image load` (no registry)
+- `envFrom.configMapRef` — inject config without rebuilding images
+- **Init container** — `busybox` waits for `redis:6379` before main container starts
+- **readinessProbe / livenessProbe** — `GET /healthz:8080` (Day 9 handler)
+
+**Edge Service** — `NodePort` with `nodePort: 30080` for stable local access; `minikube service edge --url` for tunnel URL on Linux Docker driver.
+
+**Worker Deployment** — same ConfigMap + Redis init container; no Service, no HTTP probes (no HTTP server).
+
+#### Makefile targets (`Makefile`)
+
+| Target | Steps |
+|--------|--------|
+| `make k8s-build` | Build edge + worker with `DOCKER_CONFIG=~/.docker-nocreds` (WSL credential-helper workaround) → `minikube image load` both tags |
+| `make k8s-deploy` | `kubectl apply` ConfigMap, then redis → edge → worker (ConfigMap first so env exists) |
+| `make k8s-up` | `docker compose up postgres -d` → `migrate-up` → `k8s-build` → `k8s-deploy` |
+
+**Prerequisite:** `minikube start` before `make k8s-up`.
+
+#### Image build strategy (WSL + Docker Desktop)
+
+Building inside `eval $(minikube docker-env)` hit `docker-credential-desktop.exe: exec format error`. Working path:
+
+1. Build on **host** Docker with empty cred config: `DOCKER_CONFIG=~/.docker-nocreds`
+2. Load into cluster: `minikube image load vanguard-edge:latest` (and worker)
+
+No GHCR push needed for local Minikube.
+
+#### End-to-end validation
+
+Milestone reached when:
+
+```bash
+kubectl get pods
+# edge, redis, worker all 1/1 Running
+
+curl -s http://127.0.0.1:<minikube-service-port>/healthz   # ok
+
+curl -s -X POST http://127.0.0.1:<port>/v1/events \
+  -H "Content-Type: application/json" \
+  -d '{"client_id":"k8s-test","event_type":"test","payload":{"foo":"bar"}}'
+# {"status":"queued"}
+
+# ID is assigned by Postgres on insert, not returned in 202 — look up via psql:
+docker compose exec postgres psql -U vanguard -d vanguard \
+  -c "SELECT id FROM events WHERE client_id = 'k8s-test' ORDER BY received_at DESC LIMIT 1;"
+
+curl -s http://127.0.0.1:<port>/v1/events/<uuid>
+```
+
+POST `202` + GET persisted event proves edge → Redis → worker → host Postgres → read API on K8s.
+
+#### Still deferred
+
+- HPA / autoscaling, Ingress, Helm/Kustomize
+- Kubernetes Secrets for Postgres password (ConfigMap OK for local dev only)
+- Return event `id` in `202` ingest response (today only `{"status":"queued"}`)
+- `503` on `/healthz` when deps down (K8s convention vs current `500`)
+- Probe `initialDelaySeconds` / `periodSeconds` (commented out in edge deployment)
+- `k8s-down` Makefile target
+- Graceful-shutdown goroutine fix (carried over from Day 6)
+
+#### Gotchas learned
+
+- **ConfigMap YAML** — `apiVersion: v1` (not `apps/v1`); quote all values (`"10"`, not `10`; `"true"`, not `true`)
+- **Deployment YAML** — `apiVersion: apps/v1`; Service `ports` must be a list (`- port: 6379`)
+- **Init container typo** — `- name:` needs a space after `-`; bad indentation breaks `kubectl apply`
+- **Apply order** — ConfigMap before edge/worker; otherwise pods stall waiting for `vanguard-config`
+- **`docker-credential-desktop.exe` on WSL** — breaks `docker build` even with `minikube docker-env -u`; use `DOCKER_CONFIG=~/.docker-nocreds` with `{}` config
+- **`minikube docker-env` vs `minikube image load`** — eval points CLI at Minikube’s daemon; host build + `image load` avoids Minikube DNS/credential issues during `go mod download`
+- **`minikube ssh` ≠ host compose** — run `docker compose up postgres` on WSL, not inside `minikube ssh`
+- **`host.minikube.internal`** — pods reach host Postgres; verify with `minikube ssh -- nc -vz host.minikube.internal 5432`
+- **WSL native Postgres on 5432** — `make migrate-up` hits wrong server until `sudo systemctl stop postgresql` and compose Postgres is sole listener
+- **`minikube service edge` on Linux Docker driver** — tunnel needs terminal open; use URL from `--url` without double `http://` in curl
+- **Ingest response has no id** — worker/DB assign UUID; use `psql` to GET test until API returns id in `202`
+
+#### Day 10 commands (typical flow)
+
+```bash
+minikube start --cpus=4 --memory=4096
+
+make k8s-up
+
+kubectl get pods
+minikube service edge --url
+
+# terminal 1 (optional — keeps tunnel alive on Linux)
+minikube service edge
+
+# terminal 2
+curl -s http://127.0.0.1:<port>/healthz
+curl -s -X POST http://127.0.0.1:<port>/v1/events \
+  -H "Content-Type: application/json" \
+  -d '{"client_id":"k8s-test","event_type":"test","payload":{"foo":"bar"}}'
+
+docker compose exec postgres psql -U vanguard -d vanguard \
+  -c "SELECT id FROM events WHERE client_id = 'k8s-test' ORDER BY received_at DESC LIMIT 1;"
+
+curl -s http://127.0.0.1:<port>/v1/events/<uuid>
+
+# rebuild after code changes
+make k8s-build && make k8s-deploy
+```
+
+---
