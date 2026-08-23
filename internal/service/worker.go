@@ -71,7 +71,18 @@ func (w *Worker) processOne(ctx context.Context, data []byte) {
 
 	var dbErr error
 	for retryCount := 0; retryCount < cfg.RetryMaxAttempts; retryCount++ {
+		var pgUUID pgtype.UUID
+		err := pgUUID.Scan(env.ID)
+		if err != nil {
+			log.Printf("failed to parse uuid string: %v", err)
+			if dlqErr := w.sendToDLQ(ctx, data); dlqErr != nil {
+				log.Printf("Failed to send malformed event to DLQ: %v", dlqErr)
+			}
+			handedOff = true
+			return
+		}
 		_, dbErr = w.store.CreateEvent(ctx, db.CreateEventParams{
+			ID:        pgUUID,
 			ClientID:  env.ClientID,
 			EventType: env.EventType,
 			Payload:   env.Payload,

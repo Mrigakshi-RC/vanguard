@@ -25,7 +25,8 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.svc.Ingest(r.Context(), req); err != nil {
+	id, err := h.svc.Ingest(r.Context(), req)
+	if err != nil {
 		var validationErr service.ValidationError
 		var queueErr service.QueueError
 		switch {
@@ -39,5 +40,5 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	WriteJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
+	WriteJSON(w, http.StatusAccepted, map[string]string{"status": "queued", "id": id})
 }

@@ -32,18 +32,18 @@ func NewIngestService(q queue.Queue) *IngestService {
 	return &IngestService{q: q}
 }
 
-func (s *IngestService) Ingest(ctx context.Context, req IngestRequest) error {
+func (s *IngestService) Ingest(ctx context.Context, req IngestRequest) (string, error) {
 	if err := req.Validate(); err != nil {
-		return err
+		return "", err
 	}
-
-	data, err := json.Marshal(req.ToEnvelope())
+	env := req.ToEnvelope()
+	data, err := json.Marshal(env)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if err := s.q.Enqueue(ctx, data); err != nil {
-		return QueueError{Cause: err}
+		return "", QueueError{Cause: err}
 	}
-	return nil
+	return env.ID, nil
 }

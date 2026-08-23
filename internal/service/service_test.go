@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/Mrigakshi-RC/vanguard/internal/db"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -41,7 +42,53 @@ func TestEventEnvelope_roundTrip(t *testing.T) {
 	if got.ReceivedAt.IsZero() {
 		t.Error("ReceivedAt is zero")
 	}
+	if got.ID == "" {
+		t.Error("ID is empty")
+	}
+	if _, err := uuid.Parse(got.ID); err != nil {
+		t.Errorf("ID = %q, want valid UUID: %v", got.ID, err)
+	}
 }
+
+func TestIngestService_returnsEnqueuedID(t *testing.T) {
+	q := &captureQueue{}
+	svc := NewIngestService(q)
+
+	id, err := svc.Ingest(context.Background(), IngestRequest{
+		ClientID:  "acme",
+		EventType: "ping",
+		Payload:   json.RawMessage(`{"n":1}`),
+	})
+	if err != nil {
+		t.Fatalf("Ingest() error = %v", err)
+	}
+	if id == "" {
+		t.Fatal("Ingest() returned empty id")
+	}
+
+	env, err := ParseEventEnvelope(q.data)
+	if err != nil {
+		t.Fatalf("ParseEventEnvelope() error = %v", err)
+	}
+	if id != env.ID {
+		t.Fatalf("returned id %q != enqueued envelope id %q", id, env.ID)
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		t.Errorf("id = %q, want valid UUID: %v", id, err)
+	}
+}
+
+type captureQueue struct {
+	data []byte
+}
+
+func (c *captureQueue) Enqueue(ctx context.Context, data []byte) error {
+	c.data = append([]byte(nil), data...)
+	return nil
+}
+func (c *captureQueue) Dequeue(ctx context.Context) ([]byte, error)       { return nil, nil }
+func (c *captureQueue) Requeue(ctx context.Context, data []byte) error    { return nil }
+func (c *captureQueue) EnqueueDLQ(ctx context.Context, data []byte) error { return nil }
 
 func TestTruncateForLog(t *testing.T) {
 	short := []byte("ok")
@@ -145,6 +192,28 @@ func validEnvelope(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestWorker_invalidEnvelopeIDGoesToDLQ(t *testing.T) {
+	q := &recordingQueue{}
+	store := &failingEventStore{}
+
+	b, err := json.Marshal(EventEnvelope{
+		ID:         "not-a-uuid",
+		ClientID:   "acme",
+		EventType:  "ping",
+		Payload:    json.RawMessage(`{"n":1}`),
+		ReceivedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	NewWorker(q, store).processOne(context.Background(), b)
+
+	if store.calls != 0 || q.dlq != 1 || q.requeued != 0 {
+		t.Fatalf("calls=%d dlq=%d requeued=%d", store.calls, q.dlq, q.requeued)
+	}
 }
 
 func TestWorker_malformedJSONGoesToDLQ(t *testing.T) {

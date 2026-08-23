@@ -1295,3 +1295,104 @@ make test
 ```
 
 ---
+
+### Day 12 — 2026-08-24
+
+**Goal:** Assign event IDs at ingest time and return them in the `202` response, so clients can poll `GET /v1/events/{id}` without a Postgres lookup — and the worker inserts the same UUID (foundation for future idempotency).
+
+#### Ingest path — server-generated UUID (`internal/service/envelope.go`, `internal/service/ingest.go`)
+
+- Added `github.com/google/uuid` dependency
+- `EventEnvelope` gains `id` field; `ToEnvelope()` sets `uuid.NewString()` when the API accepts a request
+- `IngestService.Ingest` now returns `(string, error)` — the envelope ID after successful `LPUSH`
+- Handler `202` body changed from `{"status":"queued"}` to `{"status":"queued","id":"<uuid>"}`
+
+Flow:
+
+```
+POST /v1/events
+  → validate request
+  → ToEnvelope() assigns UUID
+  → LPUSH envelope JSON to Redis
+  → 202 { status, id }
+```
+
+**Why at ingest, not at insert:** client gets a stable correlation ID immediately; same ID travels through the queue and into Postgres.
+
+#### Worker path — use envelope ID on insert (`internal/service/worker.go`, `db/queries/events.sql`)
+
+- `CreateEvent` SQL now accepts explicit `id` (no longer relies solely on `gen_random_uuid()` default)
+- Worker parses `env.ID` with `pgtype.UUID.Scan`; invalid/missing UUID → DLQ (same as malformed JSON)
+- Insert uses envelope UUID so `GET /v1/events/{id}` matches the `202` response after worker runs
+
+#### Docs (`docs/Failure-Modes.md`)
+
+- Ingest table: `202` documents returned `id`; note to poll GET after worker persists
+- Worker table: invalid envelope `id` → DLQ; successful insert uses same UUID as `202`
+- Read path: clarify `404` until worker inserts despite having `id` from POST
+- DLQ section: missing/invalid UUID listed as DLQ reason
+
+#### Tests
+
+| Test | Proves |
+|------|--------|
+| `TestEventEnvelope_roundTrip` | Envelope JSON includes valid UUID |
+| `TestIngestService_returnsEnqueuedID` | Returned ID matches queued envelope ID |
+| `TestIngestHandler` (extended) | `202` response includes parseable UUID |
+| `TestWorker_invalidEnvelopeIDGoesToDLQ` | Bad envelope `id` → DLQ, no `CreateEvent` |
+
+Helpers: `captureQueue` records enqueued bytes for ingest assertions.
+
+#### End-to-end validation
+
+```bash
+make up && make migrate-up
+make run    # terminal 1
+make worker # terminal 2
+
+# ingest — capture id from 202
+curl -s -X POST http://localhost:8080/v1/events \
+  -H "Content-Type: application/json" \
+  -d '{"client_id":"id-test","event_type":"ping","payload":{"n":1}}'
+# {"status":"queued","id":"550e8400-..."}
+
+curl -s http://localhost:8080/v1/events/<id-from-response>
+```
+
+On K8s (after rebuild): same flow against `minikube service edge --url` — no `psql` lookup needed for the happy path.
+
+#### Still deferred
+
+- True idempotency (dedupe on `id` / unique constraint conflict handling on retry-requeue)
+- Return `id` in load-test script assertions
+- Regenerate sqlc in CI if not already wired
+- HPA, Ingress, Secrets (carried over from Day 10)
+- Graceful-shutdown DLQ-failure edge case (Day 11)
+
+#### Gotchas learned
+
+- **`202` without `id` was a K8s testing papercut** — Day 10 required `psql` to GET; server-assigned ID at ingest fixes the client loop
+- **UUID must live on the envelope** — worker only sees Redis bytes; ID has to be in JSON before `LPUSH`
+- **Invalid UUID → DLQ, not retry** — treat like malformed envelope; don’t hammer Postgres with bad `pgtype.UUID`
+- **`CreateEvent` signature change** — sqlc regen required after adding `id` to INSERT; worker must pass `pgtype.UUID`
+- **`404` after `202` is still normal briefly** — GET hits Postgres; worker may not have inserted yet
+
+#### Day 12 commands (typical flow)
+
+```bash
+make up && make migrate-up
+make sqlc          # if queries changed locally
+make test
+
+make run
+make worker
+
+curl -s -X POST http://localhost:8080/v1/events \
+  -H "Content-Type: application/json" \
+  -d '{"client_id":"day12","event_type":"test","payload":{"ok":true}}'
+
+# use id from JSON response
+curl -s http://localhost:8080/v1/events/<id>
+```
+
+---

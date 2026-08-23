@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/Mrigakshi-RC/vanguard/internal/service"
 )
 
@@ -103,6 +104,14 @@ func TestIngestHandler(t *testing.T) {
 			}
 			if body["status"] != "queued" {
 				t.Errorf("status = %q, want queued", body["status"])
+			}
+			if tt.wantStatus == http.StatusAccepted {
+				if body["id"] == "" {
+					t.Error("id missing from 202 response")
+				}
+				if _, err := uuid.Parse(body["id"]); err != nil {
+					t.Errorf("id = %q, want valid UUID: %v", body["id"], err)
+				}
 			}
 		})
 	}

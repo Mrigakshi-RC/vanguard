@@ -1,12 +1,13 @@
 -- name: CreateEvent :one
 INSERT INTO events (
+    id,
     client_id,
     event_type,
     payload,
     status,
     received_at
 ) VALUES (
-    $1, $2, $3, 'pending', $4
+    $1, $2, $3, $4, 'pending', $5
 )
 RETURNING *;
 

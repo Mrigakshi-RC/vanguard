@@ -15,9 +15,9 @@ What can go wrong in Vanguard, and what the system does today. Useful for ops de
 | Rate limit exceeded (Redis token bucket) | Middleware blocks before handler | `429` — `"Too many requests, retry after N"` | Never queued |
 | Redis down during rate-limit check | Middleware **fail open** — logs error, passes request through | Normal ingest flow (or downstream failure) | Depends on queue |
 | Redis down during enqueue | `LPUSH` fails → `QueueError` | `503` — `"service temporarily unavailable"` | **Lost** — client should retry POST |
-| Enqueue succeeds | Event JSON on `vanguard:events:ingest` | `202` — `{"status":"queued"}` | Safe in Redis until worker pops it |
+| Enqueue succeeds | Event JSON on `vanguard:events:ingest` (includes server-generated `id`) | `202` — `{"status":"queued","id":"<uuid>"}` | Safe in Redis until worker pops it |
 
-**Important:** `202 Accepted` means queued in Redis, **not** persisted in Postgres yet.
+**Important:** `202 Accepted` means queued in Redis, **not** persisted in Postgres yet. The returned `id` is assigned at ingest time; use it to poll `GET /v1/events/{id}` after the worker inserts the row.
 
 ---
 
@@ -26,10 +26,11 @@ What can go wrong in Vanguard, and what the system does today. Useful for ops de
 | Failure | What happens | Logs | Data fate |
 |---------|--------------|------|-----------|
 | Malformed queue message (bad JSON) | Routed to DLQ (`vanguard:events:dlq`) | `Malformed event envelope: ...` | In DLQ — not in Postgres |
+| Invalid or missing envelope `id` | Routed to DLQ — worker rejects before insert | `failed to parse uuid string: ...` | In DLQ — not in Postgres |
 | Transient Postgres error (connection reset, refused, timeout, deadlock, `starting up`, etc.) | In-process retry with exponential backoff (`1s → 2s → 4s …`, max 30s), up to 5 attempts | `Transient DB error: ... Retrying in ...` | Still in worker memory during retries |
 | Transient error, retries exhausted | Message requeued to ingest list | `Database insertion failed after 5 attempts: ..., requeuing to Redis` | Back on `vanguard:events:ingest` — worker will retry later |
 | Permanent Postgres error (constraint violation, auth failure, etc.) | Routed to DLQ immediately — no retry | `Permanent database error encountered: ... Routing to DLQ.` | In DLQ — not in Postgres |
-| Insert succeeds | Worker returns — done | (none) | Row in `events` table |
+| Insert succeeds | Worker inserts row with envelope `id` | (none) | Row in `events` table with same UUID returned in `202` |
 | Redis down during `Requeue` / `EnqueueDLQ` | Error logged; message may be **lost** (already popped by `BRPOP`) | `Failed to requeue...` / `Failed to send ... to DLQ` | **At risk** — was in memory only |
 | Worker not running | Events accumulate in Redis ingest list | Clients still get `202` | Safe in Redis until worker starts |
 | Worker crash mid-`processOne` (SIGKILL, panic) | In-flight message lost if not yet requeued | Process gone | **Lost** if popped but not inserted/requeued |
@@ -48,7 +49,7 @@ What can go wrong in Vanguard, and what the system does today. Useful for ops de
 | Event not in Postgres | `pgx.ErrNoRows` | `404` — `"event not found"` |
 | Postgres down / query error | Wrapped DB error | `500` — `"internal server error"` |
 
-Read path does **not** check Redis. An event can be queued (`202`) but return `404` until the worker inserts it.
+Read path does **not** check Redis. An event can be queued (`202` with `id`) but return `404` on GET until the worker inserts it — poll after a short delay or retry.
 
 ---
 
@@ -73,6 +74,7 @@ Read path does **not** check Redis. An event can be queued (`202`) but return `4
 Messages land here when:
 
 - JSON envelope cannot be parsed
+- Envelope `id` is missing or not a valid UUID
 - Postgres returns a **non-transient** error
 - (Previously) Postgres `starting up` before Day 8 fix — now retried
 
