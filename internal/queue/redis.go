@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -32,12 +33,17 @@ func (r *RedisQueue) Enqueue(ctx context.Context, data []byte) error {
 }
 
 func (r *RedisQueue) Dequeue(ctx context.Context) ([]byte, error) {
-	result, err := r.redis.BRPop(ctx, 0, r.listKey).Result()
-	if err != nil {
-		return nil, err
+	for ctx.Err() == nil {
+		result, err := r.redis.BRPop(ctx, 1*time.Second, r.listKey).Result()
+		if err == redis.Nil {
+			continue // Timeout reached, loop and check ctx again if the process has been cancelled
+		}
+		if err != nil {
+			return nil, err // Context cancelled or connection error
+		}
+		return []byte(result[1]), nil
 	}
-	// result[0] = key, result[1] = value
-	return []byte(result[1]), nil
+	return nil, ctx.Err()
 }
 
 func (r *RedisQueue) Requeue(ctx context.Context, data []byte) error {

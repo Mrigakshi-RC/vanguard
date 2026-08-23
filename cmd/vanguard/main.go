@@ -29,11 +29,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Postgres connection failed: %v", err)
 	}
-	defer dbPool.Close()
 
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
 	})
+
+	defer redisClient.Close()
+	defer dbPool.Close()
 
 	redisQueue := queue.NewRedisQueue(redisClient, cfg.RedisListKey, cfg.RedisDLQKey)
 	eventStore := repository.NewPostgresEventStore(dbPool)
@@ -62,9 +64,11 @@ func main() {
 	}
 
 	log.Printf("Server starting on %s...", cfg.HTTPAddr)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server failed: %v", err)
-	}
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
 
 	// Shutdown gracefully
 	stop := make(chan os.Signal, 1)

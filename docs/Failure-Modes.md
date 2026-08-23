@@ -32,9 +32,10 @@ What can go wrong in Vanguard, and what the system does today. Useful for ops de
 | Insert succeeds | Worker returns — done | (none) | Row in `events` table |
 | Redis down during `Requeue` / `EnqueueDLQ` | Error logged; message may be **lost** (already popped by `BRPOP`) | `Failed to requeue...` / `Failed to send ... to DLQ` | **At risk** — was in memory only |
 | Worker not running | Events accumulate in Redis ingest list | Clients still get `202` | Safe in Redis until worker starts |
-| Worker crash mid-`processOne` | In-flight message lost if not yet requeued | Process gone | **Lost** if popped but not inserted/requeued |
+| Worker crash mid-`processOne` (SIGKILL, panic) | In-flight message lost if not yet requeued | Process gone | **Lost** if popped but not inserted/requeued |
+| Worker shutdown (SIGINT/SIGTERM) | Context cancelled → `Run` exits; in-flight message requeued via `processOne` defer if not yet handed off | `Shutting down worker...` / `Shutdown during processOne, requeuing message` | Requeued to ingest list unless insert/DLQ/requeue already succeeded |
 
-**Delivery guarantee today:** at-least-once for happy paths with retry + requeue; at-most-once if worker dies or Redis write fails after dequeue.
+**Delivery guarantee today:** at-least-once for happy paths with retry + requeue; graceful SIGTERM requeues in-flight work. Abrupt kill (SIGKILL) or Redis write failure after dequeue can still lose messages.
 
 ---
 
@@ -60,8 +61,8 @@ Read path does **not** check Redis. An event can be queued (`202`) but return `4
 | Postgres down during runtime | Ingest still works (Redis only); GET returns `500` | Retry → requeue or DLQ (see worker table) |
 | Redis down during runtime | Ingest returns `503`; rate limit fail-open | `Dequeue` errors logged; loop spins |
 | Wrong Postgres on `localhost:5432` (WSL port conflict) | May connect to wrong server — auth errors | Permanent errors → **DLQ** (not retried) |
-| API killed (SIGINT/SIGTERM) | Graceful shutdown intended (5s drain) — wiring incomplete | N/A |
-| Worker killed (SIGINT/SIGTERM) | N/A | No graceful shutdown — in-flight work may be lost |
+| API killed (SIGINT/SIGTERM) | `ListenAndServe` runs in a background goroutine; main receives signal → `http.Server.Shutdown` with 5s timeout (stops new requests, drains in-flight HTTP) → closes Redis + Postgres pool | N/A |
+| Worker killed (SIGINT/SIGTERM) | N/A | `Run` in background goroutine; signal → `cancel()` → `processOne` defer requeues unhandled messages → `wg.Wait()` before pool close. `Dequeue` uses 1s `BRPOP` timeout so cancel is not blocked indefinitely |
 
 ---
 
@@ -101,13 +102,11 @@ If counts don't match, check DLQ length and worker logs for `Permanent database 
 
 | Gap | Risk |
 |-----|------|
-| No idempotency key on events | Requeue could duplicate rows if insert succeeded but worker didn't notice |
-| Worker has no graceful shutdown | SIGKILL mid-backoff may lose in-flight messages |
+| No idempotency key on events | Requeue (including shutdown defer) could duplicate rows if insert committed before worker marked message handled |
 | `RetryBaseDelay` config unused | Backoff hardcoded to `2^attempt` seconds |
 | Rate limit always on in dev | Defaults: 10 tokens/s refill, burst capacity 20 (`VANGUARD_RATE_LIMIT_*`) |
 | No DLQ replay / alerting | Poison or misclassified messages sit silently in Redis |
 | No Redis persistence guarantee beyond Docker volume | Container wipe loses queued events |
-| API graceful shutdown code unreachable | `ListenAndServe` blocks main goroutine before signal handler |
 
 ---
 

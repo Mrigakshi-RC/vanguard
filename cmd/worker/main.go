@@ -3,6 +3,10 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/Mrigakshi-RC/vanguard/internal/config"
 	"github.com/Mrigakshi-RC/vanguard/internal/queue"
@@ -14,7 +18,8 @@ import (
 
 func main() {
 	cfg := config.Load()
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	dbPool, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {
@@ -30,7 +35,22 @@ func main() {
 	store := repository.NewPostgresEventStore(dbPool)
 	worker := service.NewWorker(redisQueue, store)
 
-	if err := worker.Run(ctx); err != nil {
-		log.Fatalf("Worker loop exited: %v", err)
-	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		if err := worker.Run(ctx); err != nil && err != context.Canceled {
+			log.Fatalf("Worker loop exited: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	log.Println("Shutting down worker...")
+	cancel()
+	wg.Wait()
+
+	log.Println("Worker shutdown complete")
 }

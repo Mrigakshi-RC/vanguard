@@ -27,13 +27,8 @@ func NewWorker(q queue.Queue, store repository.EventStore) *Worker {
 
 func (w *Worker) Run(ctx context.Context) error {
 	log.Println("Worker service started successfully...")
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
 
+	for ctx.Err() == nil {
 		data, err := w.q.Dequeue(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -44,15 +39,31 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		w.processOne(ctx, data)
 	}
+
+	return ctx.Err()
 }
 
 func (w *Worker) processOne(ctx context.Context, data []byte) {
+	handedOff := false
+
+	defer func() {
+		if handedOff {
+			return
+		}
+		if ctx.Err() != nil {
+			log.Printf("Shutdown during processOne, requeuing message")
+			if err := w.q.Requeue(context.Background(), data); err != nil {
+				log.Printf("Failed to requeue on shutdown: %v", err)
+			}
+		}
+	}()
 	env, err := ParseEventEnvelope(data)
 	if err != nil {
 		log.Printf("Malformed event envelope: %v body=%s", err, truncateForLog(data, 256))
 		if dlqErr := w.sendToDLQ(ctx, data); dlqErr != nil {
 			log.Printf("Failed to send malformed event to DLQ: %v", dlqErr)
 		}
+		handedOff = true
 		return
 	}
 
@@ -70,6 +81,7 @@ func (w *Worker) processOne(ctx context.Context, data []byte) {
 			},
 		})
 		if dbErr == nil {
+			handedOff = true
 			return
 		}
 		if !isTransientError(dbErr) {
@@ -77,6 +89,7 @@ func (w *Worker) processOne(ctx context.Context, data []byte) {
 			if dlqErr := w.sendToDLQ(ctx, data); dlqErr != nil {
 				log.Printf("Failed to send permanent failure to DLQ: %v", dlqErr)
 			}
+			handedOff = true
 			return
 		}
 		if retryCount < cfg.RetryMaxAttempts-1 {
@@ -88,8 +101,7 @@ func (w *Worker) processOne(ctx context.Context, data []byte) {
 
 			select {
 			case <-ctx.Done():
-				log.Printf("Context cancelled during retry backoff: %v", ctx.Err())
-				_ = w.q.Requeue(context.Background(), data)
+				//handled by defer at the start of processOne
 				return
 			case <-time.After(delay):
 				continue
@@ -100,7 +112,9 @@ func (w *Worker) processOne(ctx context.Context, data []byte) {
 	log.Printf("Database insertion failed after %d attempts: %v, requeuing to Redis", cfg.RetryMaxAttempts, dbErr)
 	if err := w.q.Requeue(ctx, data); err != nil {
 		log.Printf("Failed to requeue event to redis: %v", err)
+		return
 	}
+	handedOff = true
 }
 
 func truncateForLog(data []byte, max int) string {

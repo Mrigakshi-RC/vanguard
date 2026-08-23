@@ -1164,3 +1164,134 @@ make k8s-build && make k8s-deploy
 ```
 
 ---
+
+### Day 11 — 2026-08-23
+
+**Goal:** Fix graceful shutdown on both binaries — edge API and worker — so SIGINT/SIGTERM drain or requeue in-flight work instead of dropping it. Update ops docs to match.
+
+#### Edge API graceful shutdown (`cmd/vanguard/main.go`)
+
+Closed the Day 6 wiring bug: `ListenAndServe` had been blocking `main`, so the signal handler and `http.Server.Shutdown` never ran.
+
+Changes:
+
+- `ListenAndServe` moved to a **background goroutine**
+- Main thread blocks on `<-stop` after `signal.Notify(os.Interrupt, syscall.SIGTERM)`
+- `httpServer.Shutdown` with 5-second timeout drains in-flight HTTP
+- `http.ErrServerClosed` treated as clean exit in the server goroutine
+- `defer redisClient.Close()` and `defer dbPool.Close()` run after shutdown completes
+
+Intended flow (now actually reachable):
+
+```
+go ListenAndServe()
+  → SIGINT / SIGTERM on main
+  → Shutdown(5s)
+  → close Redis + Postgres pool
+  → exit
+```
+
+#### Worker graceful shutdown (`cmd/worker/main.go`, `internal/service/worker.go`)
+
+Added shutdown parity with the edge API:
+
+**`cmd/worker/main.go`**
+
+- `context.WithCancel` passed into `worker.Run`
+- Worker runs in a goroutine with `sync.WaitGroup`
+- SIGINT/SIGTERM → `cancel()` → `wg.Wait()` before `main` returns (pool stays open until worker exits)
+
+**`internal/service/worker.go` — Option A (`handedOff` + defer)**
+
+- `processOne` tracks whether the message fate is decided (`handedOff`)
+- Defer on exit: if context cancelled and not handed off → requeue to ingest list (`context.Background()` so requeue isn't blocked by cancelled ctx)
+- `handedOff = true` on: successful insert, successful explicit requeue (exhausted retries), DLQ routing
+- Backoff cancel during shutdown: return early; defer handles requeue (removed duplicate explicit requeue in the backoff branch)
+
+**`internal/queue/redis.go` — cancellable dequeue**
+
+- Replaced blocking `BRPOP(ctx, 0, ...)` with a **1-second timeout loop**
+- On timeout (`redis.Nil`), loop and re-check `ctx.Err()` so shutdown isn't stuck waiting for the next message
+
+Worker shutdown flow:
+
+```
+go worker.Run(ctx)
+  → SIGINT / SIGTERM
+  → cancel()
+  → Dequeue returns ctx.Err() OR processOne defer requeues in-flight message
+  → wg.Wait()
+  → exit
+```
+
+#### Docs (`docs/Failure-Modes.md`)
+
+Updated to reflect both shutdown paths:
+
+- Infrastructure table: edge and worker SIGTERM behavior documented
+- Worker path table: graceful shutdown row added; SIGKILL/panic still called out as data-loss case
+- Known gaps: removed "Worker has no graceful shutdown" and "API graceful shutdown unreachable"
+
+#### End-to-end validation
+
+**Edge:**
+
+```bash
+make up && make migrate-up
+make run
+# Ctrl+C → expect "Shutting down server gracefully..." then "Server gracefully stopped..."
+```
+
+**Worker:**
+
+```bash
+make worker
+# POST an event, Ctrl+C during processing
+# expect "Shutting down worker..." then "Worker shutdown complete"
+# verify message not lost:
+docker compose exec redis redis-cli LLEN vanguard:events:ingest
+```
+
+**K8s:** edge deployment already sends SIGTERM on pod delete; worker pods now requeue in-flight messages instead of losing them on rollout (still subject to `terminationGracePeriodSeconds`).
+
+#### Still deferred
+
+- Return event `id` in `202` ingest response
+- Idempotency keys (shutdown requeue + requeue path can still duplicate rows without them)
+- DLQ failure sets `handedOff = true` even when `EnqueueDLQ` fails — message may be lost unless shutdown defer requeues
+- `Retry-After` HTTP header, `X-Forwarded-For` / trusted proxy for rate limit
+- Inject retry config into `Worker` at construction (still calls `config.Load()` inside `processOne`)
+- Worker shutdown unit tests (cancel mid-`processOne`)
+- CI/CD, DLQ replay tooling (carried over from earlier days)
+
+#### Gotchas learned
+
+- **`ListenAndServe` on main blocks forever** — shutdown code after it is dead until you move the server to a goroutine (Day 6 intent, Day 11 fix)
+- **`wg.Wait()` matters on the worker** — calling `cancel()` without waiting lets `main` close the Postgres pool while `processOne` is still running
+- **`handedOff` prevents double requeue** — set it on insert success, not only on explicit requeue; otherwise shutdown defer can requeue an already-persisted event
+- **`handedOff` on DLQ failure is still loose** — if `sendToDLQ` fails, code still marks handed off; defer won't retry (minor edge case)
+- **`BRPOP` with timeout 0 blocks shutdown** — 1s polling loop lets `ctx.Done()` be checked between waits
+- **SIGKILL vs SIGTERM** — graceful path only applies to SIGINT/SIGTERM; `kill -9` still loses in-flight worker messages
+- **Defer requeues to ingest, not DLQ** — malformed messages that fail DLQ during shutdown may loop until DLQ succeeds
+
+#### Day 11 commands (typical flow)
+
+```bash
+make up
+make migrate-up
+
+# terminal 1
+make run
+curl -s http://localhost:8080/healthz
+
+# terminal 2
+make worker
+curl -s -X POST http://localhost:8080/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"client_id":"shutdown-test","event_type":"ping","payload":{"n":1}}'
+
+# Ctrl+C worker, then edge — confirm shutdown logs on each
+make test
+```
+
+---
